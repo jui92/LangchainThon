@@ -1,3 +1,7 @@
+###############################################################################################
+# 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다. #
+##############################################################################################
+
 # -*- coding: utf-8 -*-
 import os, re, json, urllib.parse, random, time, io
 from typing import Optional, Tuple, Dict, List
@@ -20,7 +24,7 @@ except ImportError:
     st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
     st.stop()
 
-API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
 if not API_KEY:
     API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
 if not API_KEY:
@@ -142,6 +146,66 @@ def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str,str]:
     meta["job_title"] = re.sub(r"\s+"," ", jt).strip()[:120]
     return meta
 
+# ================== 규칙 기반 보강 파서 (★ FIX: 우대 사항 보장) ==================
+def rule_based_sections(raw_text: str) -> dict:
+    """
+    원문 텍스트를 라인 단위로 훑어 '주요 업무 / 자격 요건 / 우대 사항' 섹션을 최대한 복구한다.
+    - 섹션 헤더 키워드 매칭
+    - 불릿/특수문자 제거
+    - 우대 키워드 탐지 시 preferences로 이동
+    """
+    txt = re.sub(r"\r", "", raw_text or "").strip()
+    lines = [re.sub(r"\s+", " ", l).strip(" -•·▶▪️") for l in txt.split("\n")]
+    lines = [l for l in lines if l]
+
+    # 섹션 헤더
+    hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
+    hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
+    hdr_pref = re.compile(r"(우대\s*사항|우대|Preferred|Nice\s*to\s*have|Plus)", re.I)
+
+    # 우대 키워드
+    kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
+
+    out = {"responsibilities": [], "qualifications": [], "preferences": []}
+    bucket = None
+
+    def push(line, key):
+        t = re.sub(r"\s+", " ", line).strip(" -•·▶▪️").strip()
+        if t and len(t) > 1 and t not in out[key]:
+            out[key].append(t[:180])
+
+    for l in lines:
+        if hdr_resp.search(l):
+            bucket = "responsibilities"; continue
+        if hdr_qual.search(l):
+            bucket = "qualifications"; continue
+        if hdr_pref.search(l):
+            bucket = "preferences"; continue
+
+        if bucket is None:
+            # 섹션 헤더가 없더라도 우대 키워드가 있으면 preferences에 적재
+            if kw_pref.search(l):
+                push(l, "preferences")
+            # 기술 키워드가 보이면 responsibilities로 추정
+            elif any(k in l.lower() for k in ["java","python","spark","airflow","kafka","ml","sql","aws","k8s","docker"]):
+                push(l, "responsibilities")
+            continue
+        else:
+            # 섹션이 qualifications인데 우대 키워드 포함 시 preferences로 이동
+            if bucket == "qualifications" and kw_pref.search(l):
+                push(l, "preferences")
+            else:
+                push(l, bucket)
+
+    # 중복 제거 & 상한
+    for k in out:
+        seen=set(); cleaned=[]
+        for s in out[k]:
+            if s and s not in seen:
+                seen.add(s); cleaned.append(s)
+        out[k] = cleaned[:12]
+    return out
+
 # ================== LLM 정제 (채용 공고 → 구조 JSON) ==================
 PROMPT_SYSTEM_STRUCT = (
     "너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
@@ -150,7 +214,7 @@ PROMPT_SYSTEM_STRUCT = (
 )
 
 def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
-    ctx = raw_text.strip()
+    ctx = (raw_text or "").strip()
     if len(ctx) > 9000:
         ctx = ctx[:9000]
 
@@ -171,7 +235,9 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             "\"responsibilities\": [str], "
             "\"qualifications\": [str], "
             "\"preferences\": [str]"
-            "}"
+            "}\n"
+            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/Preferred/Nice to have/Plus' 등 표시가 있는 항목을 그대로 담아라.\n"
+            "- 불릿/마커/이모지 제거, 문장 간결화, 중복 제거."
         ),
     }
 
@@ -182,23 +248,8 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg],
         )
         data = json.loads(resp.choices[0].message.content)
-
-        for k in ["responsibilities","qualifications","preferences"]:
-            if not isinstance(data.get(k, []), list):
-                data[k] = []
-            clean = []
-            seen = set()
-            for it in data[k]:
-                t = re.sub(r"\s+"," ", str(it)).strip(" -•·").strip()
-                if t and t not in seen:
-                    seen.add(t); clean.append(t)
-            data[k] = clean[:12]
-        for k in ["company_name","company_intro","job_title"]:
-            if k in data and isinstance(data[k], str):
-                data[k] = re.sub(r"\s+"," ", data[k]).strip()
-        return data
     except Exception as e:
-        return {
+        data = {
             "company_name": meta_hint.get("company_name",""),
             "company_intro": meta_hint.get("company_intro","원문이 정제되지 않았습니다."),
             "job_title": meta_hint.get("job_title",""),
@@ -207,6 +258,52 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             "preferences": [],
             "error": str(e),
         }
+
+    # 1) 1차 클린업 (불릿/공백/중복)
+    for k in ["responsibilities","qualifications","preferences"]:
+        arr = data.get(k, [])
+        if not isinstance(arr, list): arr = []
+        cleaned=[]; seen=set()
+        for it in arr:
+            t = re.sub(r"\s+"," ", str(it)).strip(" -•·▶▪️").strip()
+            if t and t not in seen:
+                seen.add(t); cleaned.append(t[:180])
+        data[k] = cleaned[:12]
+
+    for k in ["company_name","company_intro","job_title"]:
+        if k in data and isinstance(data[k], str):
+            data[k] = re.sub(r"\s+"," ", data[k]).strip()
+
+    # 2) ★ FIX: 규칙 기반 보강 → preferences 비었을 때/부족할 때 메우기
+    rb = rule_based_sections(ctx)
+    # (a) 비었으면 규칙 결과로 채우기
+    if not data.get("preferences"):
+        data["preferences"] = rb.get("preferences", [])[:12]
+    # (b) 여전히 비면 자격요건 중 우대 키워드 포함 라인을 이동
+    if not data["preferences"]:
+        kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
+        remain=[]; moved=[]
+        for q in data.get("qualifications", []):
+            if kw_pref.search(q): moved.append(q)
+            else: remain.append(q)
+        data["preferences"] = moved[:12]
+        data["qualifications"] = remain[:12]
+
+    # 3) responsibilities/qualifications도 규칙 기반으로 보강(필요 시)
+    if not data.get("responsibilities"):
+        data["responsibilities"] = rb.get("responsibilities", [])[:12]
+    if not data.get("qualifications"):
+        data["qualifications"] = rb.get("qualifications", [])[:12]
+
+    # 최종 중복 정리
+    for k in ["responsibilities","qualifications","preferences"]:
+        seen=set(); dedup=[]
+        for s in data.get(k, []):
+            if s and s not in seen:
+                seen.add(s); dedup.append(s)
+        data[k] = dedup[:12]
+
+    return data
 
 # ================== 파일 리더 (PDF/TXT/MD/DOCX) ==================
 try:
@@ -294,7 +391,7 @@ if st.button("원문 수집 → 정제", type="primary"):
             st.session_state.clean_struct = clean
             st.success("정제 완료!")
 
-# ================== 2) 회사 요약 (정제 결과) ==================
+# ================== 2) 회사 요약 ==================
 st.header("2) 회사 요약")
 clean = st.session_state.clean_struct
 if clean:
@@ -304,13 +401,13 @@ if clean:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**주요 업무**")
-        for b in clean.get("주요업무", []): st.markdown(f"- {b}")
+        for b in clean.get("responsibilities", []): st.markdown(f"- {b}")
     with c2:
         st.markdown("**자격 요건**")
-        for b in clean.get("자격요건", []): st.markdown(f"- {b}")
+        for b in clean.get("qualifications", []): st.markdown(f"- {b}")
     with c3:
         st.markdown("**우대 사항**")
-        prefs = clean.get("우대사항", [])
+        prefs = clean.get("preferences", [])
         if prefs:
             for b in prefs: st.markdown(f"- {b}")
         else:
