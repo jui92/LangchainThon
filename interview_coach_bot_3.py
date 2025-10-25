@@ -1,21 +1,23 @@
-###############################################################################################
-# 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다. #
-##############################################################################################
-
 # -*- coding: utf-8 -*-
-import os, re, json, urllib.parse, random, time, io
+"""
+Company-tailored helper: 채용 URL → 정제 → 회사 요약 / 요건 → 이력서 업로드 → 자소서 생성
+- 우대 사항 키: preferred_qualifications (aliases 흡수)
+- 규칙 기반 보강 파서로 우대 항목 확실히 채움
+"""
+
+import os, re, io, json, urllib.parse
 from typing import Optional, Tuple, Dict, List
 
 import requests
 from bs4 import BeautifulSoup
 import html2text
 import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# ================== 기본 설정 ==================
-st.set_page_config(page_title="Job_Helper_Bot (자소서 생성)", page_icon="📑", layout="wide")
-st.title("Job_Helper_Bot : 채용 공고 URL → 회사 요약 → 이력서 등록 → 자소서 생성")
+# ================== Streamlit 기본 ==================
+st.set_page_config(page_title="Job Helper (우대사항 보강·별칭 통합)", page_icon="🧭", layout="wide")
+st.title("Job Helper — 채용 URL 정제 · 회사 요약 · 이력서 업로드 · 자소서 생성")
 
 # ================== OpenAI ==================
 try:
@@ -29,11 +31,12 @@ if not API_KEY:
     API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
 if not API_KEY:
     st.stop()
+
 client = OpenAI(api_key=API_KEY)
 
 with st.sidebar:
     st.subheader("모델 설정")
-    CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
+    CHAT_MODEL  = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
     EMBED_MODEL = st.selectbox("임베딩 모델(내부용)", ["text-embedding-3-small","text-embedding-3-large"], index=0)
 
 # ================== HTTP 유틸 ==================
@@ -62,6 +65,7 @@ def http_get(url: str, timeout: int = 12) -> Optional[requests.Response]:
 
 # ================== 원문 수집 (Jina → Web → BS4) ==================
 def fetch_jina_text(url: str, timeout: int = 15) -> str:
+    """Jina Reader 프록시(정적 텍스트 스냅샷) 시도"""
     try:
         parts = urllib.parse.urlsplit(url)
         prox = f"https://r.jina.ai/http://{parts.netloc}{parts.path}"
@@ -89,6 +93,7 @@ def fetch_bs4_text(url: str) -> Tuple[str, Optional[BeautifulSoup]]:
     r = http_get(url, timeout=12)
     if not r: return "", None
     soup = BeautifulSoup(r.text, "lxml")
+    # 큰 블록 추출
     blocks = []
     for sel in ["article","section","main","div","ul","ol"]:
         for el in soup.select(sel):
@@ -118,7 +123,7 @@ def fetch_all_text(url: str):
     bs, soup = fetch_bs4_text(url)
     return bs, {"source":"bs4","len":len(bs),"url_final":url}, soup
 
-# ================== 메타/섹션 보조 추출 ==================
+# ================== 메타 추출(회사명/소개/직무명 힌트) ==================
 def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str,str]:
     meta = {"company_name":"","company_intro":"","job_title":""}
     if not soup: return meta
@@ -146,27 +151,24 @@ def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str,str]:
     meta["job_title"] = re.sub(r"\s+"," ", jt).strip()[:120]
     return meta
 
-# ================== 규칙 기반 보강 파서 (★ FIX: 우대 사항 보장) ==================
+# ================== 규칙 기반 보강 파서(우대사항 보장) ==================
 def rule_based_sections(raw_text: str) -> dict:
     """
-    원문 텍스트를 라인 단위로 훑어 '주요 업무 / 자격 요건 / 우대 사항' 섹션을 최대한 복구한다.
+    원문에서 '주요 업무 / 자격 요건 / 우대 사항' 섹션을 최대한 복구.
     - 섹션 헤더 키워드 매칭
     - 불릿/특수문자 제거
-    - 우대 키워드 탐지 시 preferences로 이동
+    - 우대 키워드가 들어간 줄은 우대 사항으로 이동
     """
     txt = re.sub(r"\r", "", raw_text or "").strip()
     lines = [re.sub(r"\s+", " ", l).strip(" -•·▶▪️") for l in txt.split("\n")]
     lines = [l for l in lines if l]
 
-    # 섹션 헤더
     hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
     hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
     hdr_pref = re.compile(r"(우대\s*사항|우대|Preferred|Nice\s*to\s*have|Plus)", re.I)
+    kw_pref  = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
 
-    # 우대 키워드
-    kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
-
-    out = {"responsibilities": [], "qualifications": [], "preferences": []}
+    out = {"responsibilities": [], "qualifications": [], "preferred_qualifications": []}
     bucket = None
 
     def push(line, key):
@@ -180,24 +182,20 @@ def rule_based_sections(raw_text: str) -> dict:
         if hdr_qual.search(l):
             bucket = "qualifications"; continue
         if hdr_pref.search(l):
-            bucket = "preferences"; continue
+            bucket = "preferred_qualifications"; continue
 
         if bucket is None:
-            # 섹션 헤더가 없더라도 우대 키워드가 있으면 preferences에 적재
             if kw_pref.search(l):
-                push(l, "preferences")
-            # 기술 키워드가 보이면 responsibilities로 추정
+                push(l, "preferred_qualifications")
             elif any(k in l.lower() for k in ["java","python","spark","airflow","kafka","ml","sql","aws","k8s","docker"]):
                 push(l, "responsibilities")
             continue
         else:
-            # 섹션이 qualifications인데 우대 키워드 포함 시 preferences로 이동
             if bucket == "qualifications" and kw_pref.search(l):
-                push(l, "preferences")
+                push(l, "preferred_qualifications")
             else:
                 push(l, bucket)
 
-    # 중복 제거 & 상한
     for k in out:
         seen=set(); cleaned=[]
         for s in out[k]:
@@ -206,7 +204,35 @@ def rule_based_sections(raw_text: str) -> dict:
         out[k] = cleaned[:12]
     return out
 
-# ================== LLM 정제 (채용 공고 → 구조 JSON) ==================
+# ================== 우대 별칭 흡수(표준키 preferred_qualifications) ==================
+PREF_ALIASES = [
+    "preferences", "preferred", "preferred_qualifications", "preferred_requirements",
+    "preferred_skills", "nice_to_have", "nice_to_haves",
+    "desirables", "desirable_qualifications", "plus", "bonus_qualifications", "good_to_have"
+]
+
+def unify_preferred_field(data: dict) -> dict:
+    bucket = []
+    for k in PREF_ALIASES:
+        v = data.get(k, [])
+        if isinstance(v, str):
+            v = [v]
+        if isinstance(v, list):
+            bucket.extend(v)
+    # clean & dedup
+    seen, cleaned = set(), []
+    for x in bucket:
+        t = re.sub(r"\s+"," ", str(x)).strip(" -•·▶▪️").strip()
+        if t and t not in seen:
+            seen.add(t); cleaned.append(t[:180])
+    data["preferred_qualifications"] = cleaned[:12]
+    # 별칭키 제거(선택)
+    for k in PREF_ALIASES:
+        if k != "preferred_qualifications" and k in data:
+            data.pop(k, None)
+    return data
+
+# ================== LLM 구조화(회사/직무/요건) ==================
 PROMPT_SYSTEM_STRUCT = (
     "너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
     "입력 텍스트는 포털 광고 문구, UI잔재, 복수 직무가 섞여 있을 수 있다. "
@@ -215,8 +241,8 @@ PROMPT_SYSTEM_STRUCT = (
 
 def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
     ctx = (raw_text or "").strip()
-    if len(ctx) > 9000:
-        ctx = ctx[:9000]
+    if len(ctx) > 12000:
+        ctx = ctx[:12000]
 
     user_msg = {
         "role": "user",
@@ -234,9 +260,9 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             "\"job_title\": str, "
             "\"responsibilities\": [str], "
             "\"qualifications\": [str], "
-            "\"preferences\": [str]"
+            "\"preferred_qualifications\": [str]"
             "}\n"
-            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/Preferred/Nice to have/Plus' 등 표시가 있는 항목을 그대로 담아라.\n"
+            "- 'preferred_qualifications'에는 원문 중 '우대/선호/Preferred/Nice to have/Plus' 등의 항목을 그대로 담을 것.\n"
             "- 불릿/마커/이모지 제거, 문장 간결화, 중복 제거."
         ),
     }
@@ -255,12 +281,12 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             "job_title": meta_hint.get("job_title",""),
             "responsibilities": [],
             "qualifications": [],
-            "preferences": [],
+            "preferred_qualifications": [],
             "error": str(e),
         }
 
-    # 1) 1차 클린업 (불릿/공백/중복)
-    for k in ["responsibilities","qualifications","preferences"]:
+    # 1) 1차 클린업
+    for k in ["responsibilities","qualifications","preferred_qualifications"]:
         arr = data.get(k, [])
         if not isinstance(arr, list): arr = []
         cleaned=[]; seen=set()
@@ -274,34 +300,20 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
         if k in data and isinstance(data[k], str):
             data[k] = re.sub(r"\s+"," ", data[k]).strip()
 
-    # 2) ★ FIX: 규칙 기반 보강 → preferences 비었을 때/부족할 때 메우기
+    # 2) 규칙 기반 보강
     rb = rule_based_sections(ctx)
-    # (a) 비었으면 규칙 결과로 채우기
-    if not data.get("preferences"):
-        data["preferences"] = rb.get("preferences", [])[:12]
-    # (b) 여전히 비면 자격요건 중 우대 키워드 포함 라인을 이동
-    if not data["preferences"]:
-        kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
-        remain=[]; moved=[]
-        for q in data.get("qualifications", []):
-            if kw_pref.search(q): moved.append(q)
-            else: remain.append(q)
-        data["preferences"] = moved[:12]
-        data["qualifications"] = remain[:12]
 
-    # 3) responsibilities/qualifications도 규칙 기반으로 보강(필요 시)
+    # 우대: 비었거나 적다면 보강
+    if not data.get("preferred_qualifications"):
+        data["preferred_qualifications"] = rb.get("preferred_qualifications", [])[:12]
+
     if not data.get("responsibilities"):
         data["responsibilities"] = rb.get("responsibilities", [])[:12]
     if not data.get("qualifications"):
         data["qualifications"] = rb.get("qualifications", [])[:12]
 
-    # 최종 중복 정리
-    for k in ["responsibilities","qualifications","preferences"]:
-        seen=set(); dedup=[]
-        for s in data.get(k, []):
-            if s and s not in seen:
-                seen.add(s); dedup.append(s)
-        data[k] = dedup[:12]
+    # 3) 별칭 통합(안전망)
+    data = unify_preferred_field(data)
 
     return data
 
@@ -344,7 +356,7 @@ def read_file_text(uploaded) -> str:
         return read_docx(data)
     return ""
 
-# ================== 간단 청크/임베딩 ==================
+# ================== 임베딩 유틸 ==================
 def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
     t = re.sub(r"\s+"," ", text).strip()
     if not t: return []
@@ -364,18 +376,20 @@ def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
     return vecs
 
 # ================== 세션 상태 ==================
-if "clean_struct" not in st.session_state:
-    st.session_state.clean_struct = None
-if "resume_raw" not in st.session_state:
-    st.session_state.resume_raw = ""
-if "resume_chunks" not in st.session_state:
-    st.session_state.resume_chunks = []
-if "resume_embeds" not in st.session_state:
-    st.session_state.resume_embeds = None
+def _init_state():
+    for k, v in {
+        "clean_struct": None,
+        "resume_raw": "",
+        "resume_chunks": [],
+        "resume_embeds": None,
+    }.items():
+        if k not in st.session_state: st.session_state[k] = v
+_init_state()
 
 # ================== 1) 채용 공고 URL → 정제 ==================
 st.header("1) 채용 공고 URL → 정제")
-url = st.text_input("채용 공고 상세 URL", placeholder="채용 공고 사이트의 URL을 입력하세요")
+url = st.text_input("채용 공고 상세 URL", placeholder="예: https://www.wanted.co.kr/wd/123456")
+
 if st.button("원문 수집 → 정제", type="primary"):
     if not url.strip():
         st.warning("URL을 입력하세요.")
@@ -391,8 +405,8 @@ if st.button("원문 수집 → 정제", type="primary"):
             st.session_state.clean_struct = clean
             st.success("정제 완료!")
 
-# ================== 2) 회사 요약 ==================
-st.header("2) 회사 요약")
+# ================== 2) 회사 요약 (정제 결과) ==================
+st.header("2) 회사 요약 (정제 결과)")
 clean = st.session_state.clean_struct
 if clean:
     st.markdown(f"**회사명:** {clean.get('company_name','-')}")
@@ -407,7 +421,7 @@ if clean:
         for b in clean.get("qualifications", []): st.markdown(f"- {b}")
     with c3:
         st.markdown("**우대 사항**")
-        prefs = clean.get("preferences", [])
+        prefs = clean.get("preferred_qualifications", [])
         if prefs:
             for b in prefs: st.markdown(f"- {b}")
         else:
@@ -417,14 +431,14 @@ else:
 
 st.divider()
 
-# ================== 3) 내 이력서/프로젝트 업로드 (DOCX/TXT/MD/PDF) ==================
+# ================== 3) 내 이력서/프로젝트 업로드 ==================
 st.header("3) 내 이력서/프로젝트 업로드")
 uploads = st.file_uploader(
     "이력서/프로젝트 파일 업로드 (PDF/TXT/MD/DOCX, 여러 개 가능)",
     type=["pdf","txt","md","docx"], accept_multiple_files=True
 )
 
-# 내부용 기본 파라미터 (UI 비노출)
+# 내부 고정 파라미터 (UI 비노출)
 _RESUME_CHUNK = 600
 _RESUME_OVLP  = 120
 
@@ -448,17 +462,15 @@ if st.button("이력서 인덱싱(자동)", type="secondary"):
             st.session_state.resume_embeds = embeds
             st.success(f"인덱싱 완료 (청크 {len(chunks)}개)")
 
-# ================== (Step1) 자소서 생성 섹션 ==================
+# ================== 4) 이력서 기반 자소서 생성 ==================
 st.header("4) 이력서 기반 자소서 생성")
-topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 성장 과정 / 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
+topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
 
 def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, model: str) -> str:
     company = json.dumps(clean_struct or {}, ensure_ascii=False)
-    # 이력서 길이 제한 
     resume_snippet = resume_text.strip()
     if len(resume_snippet) > 9000:
         resume_snippet = resume_snippet[:9000]
-
     system = (
         "너는 한국어 자기소개서 전문가다. 채용 공고의 회사/직무 요건과 후보자의 이력서를 참고해 "
         "회사 특화 자소서를 작성한다. 과장/허위는 금지하고, 수치/지표/기간/임팩트 중심으로 구체화한다."
@@ -467,12 +479,11 @@ def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, mo
         req = f"회사 측 요청 주제는 '{topic_hint.strip()}' 이다. 이 주제를 중심으로 서술하라."
     else:
         req = "특정 주제 요청이 없으므로, 채용 공고의 요건을 중심으로 지원동기와 직무적합성을 강조하라."
-
     user = (
         f"[회사/직무 요약(JSON)]\n{company}\n\n"
         f"[후보자 이력서(요약 가능)]\n{resume_snippet}\n\n"
         f"[작성 지시]\n- {req}\n"
-        "- 분량: 600~1000자\n"
+        "- 분량: 600~900자\n"
         "- 구성: 1) 지원 동기 2) 직무 관련 핵심 역량·경험 3) 성과/지표 4) 입사 후 기여 방안 5) 마무리\n"
         "- 자연스럽고 진정성 있는 1인칭 서술. 문장과 문단 가독성을 유지.\n"
         "- 불필요한 미사여구/중복/광고 문구 삭제."
@@ -502,3 +513,5 @@ if st.button("자소서 생성", type="primary"):
             file_name="cover_letter.txt",
             mime="text/plain"
         )
+
+st.caption("※ 우대 사항 키는 내부적으로 'preferred_qualifications'로 통일되며, preferences/nice_to_have 등 별칭도 자동 흡수됩니다.")
