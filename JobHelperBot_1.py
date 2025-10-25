@@ -1,3 +1,7 @@
+###############################################################################################
+# 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다. #
+##############################################################################################
+
 # -*- coding: utf-8 -*-
 import os, re, json, urllib.parse, random, time, io
 from typing import Optional, Tuple, Dict, List
@@ -10,8 +14,8 @@ import pandas as pd
 import numpy as np
 
 # ================== 기본 설정 ==================
-st.set_page_config(page_title="회사 맞춤 면접 코치 (Step1: 자소서 추가)", page_icon="🧭", layout="wide")
-st.title("회사 맞춤 면접 코치 · 채용 URL → 정제 → (Step1) 이력서 기반 자소서")
+st.set_page_config(page_title="Job_Helper_Bot (자소서 생성)", page_icon="📑", layout="wide")
+st.title("Job_Helper_Bot : 채용 공고 URL → 회사 요약 → 이력서 등록 → 자소서 생성")
 
 # ================== OpenAI ==================
 try:
@@ -182,7 +186,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg],
         )
         data = json.loads(resp.choices[0].message.content)
-        # 후처리
+
         for k in ["responsibilities","qualifications","preferences"]:
             if not isinstance(data.get(k, []), list):
                 data[k] = []
@@ -247,7 +251,7 @@ def read_file_text(uploaded) -> str:
         return read_docx(data)
     return ""
 
-# ================== 간단 청크/임베딩(내부: 숨김) ==================
+# ================== 간단 청크/임베딩 ==================
 def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
     t = re.sub(r"\s+"," ", text).strip()
     if not t: return []
@@ -278,7 +282,7 @@ if "resume_embeds" not in st.session_state:
 
 # ================== 1) 채용 공고 URL → 정제 ==================
 st.header("1) 채용 공고 URL → 정제")
-url = st.text_input("채용 공고 상세 URL", placeholder="예: https://www.wanted.co.kr/wd/123456")
+url = st.text_input("채용 공고 상세 URL", placeholder="채용 공고 사이트의 URL을 입력하세요")
 if st.button("원문 수집 → 정제", type="primary"):
     if not url.strip():
         st.warning("URL을 입력하세요.")
@@ -295,7 +299,7 @@ if st.button("원문 수집 → 정제", type="primary"):
             st.success("정제 완료!")
 
 # ================== 2) 회사 요약 (정제 결과) ==================
-st.header("2) 회사 요약 (정제 결과)")
+st.header("2) 회사 요약")
 clean = st.session_state.clean_struct
 if clean:
     st.markdown(f"**회사명:** {clean.get('company_name','-')}")
@@ -352,12 +356,12 @@ if st.button("이력서 인덱싱(자동)", type="secondary"):
             st.success(f"인덱싱 완료 (청크 {len(chunks)}개)")
 
 # ================== (Step1) 자소서 생성 섹션 ==================
-st.header("4) 이력서 기반 자소서 생성 (Step1)")
+st.header("4) 이력서 기반 자소서 생성")
 topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 성장 과정 / 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
 
 def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, model: str) -> str:
     company = json.dumps(clean_struct or {}, ensure_ascii=False)
-    # 이력서 길이 제한 (안전)
+    # 이력서 길이 제한 
     resume_snippet = resume_text.strip()
     if len(resume_snippet) > 9000:
         resume_snippet = resume_snippet[:9000]
@@ -375,7 +379,7 @@ def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, mo
         f"[회사/직무 요약(JSON)]\n{company}\n\n"
         f"[후보자 이력서(요약 가능)]\n{resume_snippet}\n\n"
         f"[작성 지시]\n- {req}\n"
-        "- 분량: 600~900자\n"
+        "- 분량: 600~1000자\n"
         "- 구성: 1) 지원 동기 2) 직무 관련 핵심 역량·경험 3) 성과/지표 4) 입사 후 기여 방안 5) 마무리\n"
         "- 자연스럽고 진정성 있는 1인칭 서술. 문장과 문단 가독성을 유지.\n"
         "- 불필요한 미사여구/중복/광고 문구 삭제."
@@ -405,5 +409,3 @@ if st.button("자소서 생성", type="primary"):
             file_name="cover_letter.txt",
             mime="text/plain"
         )
-
-st.caption("※ 현재 단계는 1번 요구사항만 반영했습니다: DOCX 지원, RAG 파라미터는 내부 자동, 이력서 기반 자소서 생성. 다음 단계(질문/RAG결합/채점강화/팔로업 피드백)는 이후에 순차 적용하겠습니다.")
