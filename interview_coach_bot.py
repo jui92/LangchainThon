@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, re, json, urllib.parse, random, time, io, textwrap
+import os, re, json, urllib.parse, random, time, io
 from typing import Optional, Tuple, Dict, List
 
 import requests
@@ -10,8 +10,8 @@ import pandas as pd
 import numpy as np
 
 # ================== 기본 설정 ==================
-st.set_page_config(page_title="회사 맞춤 면접 코치 (RAG 확장판)", page_icon="🚀", layout="wide")
-st.title("회사 맞춤 면접 코치 · 채용 URL → 정제 → RAG 초안 → 채점/코칭 → 레이더/세션")
+st.set_page_config(page_title="회사 맞춤 면접 코치 (Step2: 질문/RAG/팔로업)", page_icon="🎯", layout="wide")
+st.title("회사 맞춤 면접 코치 · URL 정제 → 자소서 → (Step2) 질문/RAG/팔로업/엄격 채점")
 
 # ================== OpenAI ==================
 try:
@@ -29,8 +29,8 @@ client = OpenAI(api_key=API_KEY)
 
 with st.sidebar:
     st.subheader("모델 설정")
-    CHAT_MODEL = st.selectbox("대화/채점 모델", ["gpt-4o-mini","gpt-4o"], index=0)
-    EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
+    CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
+    EMBED_MODEL = st.selectbox("임베딩 모델(내부용)", ["text-embedding-3-small","text-embedding-3-large"], index=0)
 
 # ================== HTTP 유틸 ==================
 def normalize_url(u: str) -> Optional[str]:
@@ -208,11 +208,30 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             "error": str(e),
         }
 
-# ================== RAG: 이력서/프로젝트 업로드 ==================
+# ================== 파일 리더 (PDF/TXT/MD/DOCX) ==================
 try:
     import pypdf
 except Exception:
     pypdf = None
+
+def read_pdf(data: bytes) -> str:
+    if pypdf is None:
+        return ""
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        return "\n\n".join([(reader.pages[i].extract_text() or "") for i in range(len(reader.pages))])
+    except Exception:
+        return ""
+
+def read_docx(data: bytes) -> str:
+    try:
+        import docx2txt, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
+            tmp.write(data); tmp.flush()
+            text = docx2txt.process(tmp.name) or ""
+            return text
+    except Exception:
+        return ""
 
 def read_file_text(uploaded) -> str:
     name = uploaded.name.lower()
@@ -223,16 +242,13 @@ def read_file_text(uploaded) -> str:
             except Exception: continue
         return data.decode("utf-8", errors="ignore")
     elif name.endswith(".pdf"):
-        if pypdf is None:
-            return ""
-        try:
-            reader = pypdf.PdfReader(io.BytesIO(data))
-            return "\n\n".join([(reader.pages[i].extract_text() or "") for i in range(len(reader.pages))])
-        except Exception:
-            return ""
+        return read_pdf(data)
+    elif name.endswith(".docx"):
+        return read_docx(data)
     return ""
 
-def chunk(text: str, size: int = 900, overlap: int = 150) -> List[str]:
+# ================== 간단 청크/임베딩(내부: 숨김) ==================
+def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
     t = re.sub(r"\s+"," ", text).strip()
     if not t: return []
     out, start = [], 0
@@ -243,10 +259,10 @@ def chunk(text: str, size: int = 900, overlap: int = 150) -> List[str]:
         start = max(0, end-overlap)
     return out
 
-def embed_texts(texts: List[str]) -> np.ndarray:
+def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
     if not texts:
         return np.zeros((0, 1536), dtype=np.float32)
-    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    resp = client.embeddings.create(model=model_name, input=texts)
     vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
     return vecs
 
@@ -261,42 +277,51 @@ def cosine_topk(matrix: np.ndarray, query_vec: np.ndarray, k: int = 4):
     return sims[idx], idx
 
 def retrieve_resume_chunks(query: str, k: int = 4):
-    store = st.session_state.get("rag_store", {})
-    chs, embs = store.get("chunks", []), store.get("embeds")
+    chs, embs = st.session_state.get("resume_chunks", []), st.session_state.get("resume_embeds", None)
     if not chs or embs is None:
         return []
-    qv = embed_texts([query])
+    qv = embed_texts([query], EMBED_MODEL)
     scores, idxs = cosine_topk(embs, qv, k=k)
     return [(float(s), chs[int(i)]) for s, i in zip(scores, idxs)]
 
-# ================== 질문/초안/채점 프롬프트 ==================
+# ================== 질문/초안/채점/팔로업 프롬프트 ==================
 PROMPT_SYSTEM_Q = (
-    "너는 채용담당자다. 회사/직무 맥락과 채용요건을 반영해 면접 질문을 한국어로 생성한다. "
-    "질문은 서로 형태·관점·키워드가 겹치지 않게 다양화하고, 수치/지표/기간/규모/리스크 등도 섞어라."
+    "너는 채용담당자다. 회사/직무 맥락과 채용요건, 그리고 지원자의 이력서 요약을 함께 고려해 "
+    "면접 질문을 한국어로 생성한다. 질문은 서로 형태·관점·키워드가 겹치지 않게 다양화하고, "
+    "수치/지표/기간/규모/리스크/트레이드오프 등도 섞어라."
 )
 
 PROMPT_SYSTEM_DRAFT = (
-    "너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서/프로젝트 요약을 결합해 "
+    "너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서 요약을 결합해 "
     "질문에 대한 답변 **초안**을 STAR(상황-과제-행동-성과)로 8~12문장, 한국어로 작성한다. "
     "가능하면 구체적인 지표/수치/기간/임팩트를 포함하라."
 )
 
-PROMPT_SYSTEM_SCORE = (
-    "너는 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
-    "각 기준은 0~20 정수, 총점은 기준 합계(최대 100)와 반드시 일치해야 한다. "
-    "각 기준에 대해 짧은 코멘트(강점/감점요인/개선포인트 포함)를 제공하라."
+PROMPT_SYSTEM_SCORE_STRICT = (
+    "너는 매우 엄격한 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
+    "각 기준은 0~20 정수이며, 총점은 기준 합계(최대 100)와 반드시 일치해야 한다. "
+    "과장/모호함/근거 부재/숫자 없는 주장/책임 회피/모호한 주어 사용 등을 강하게 감점하라. "
+    "각 기준에 대해 짧지만 구체적 코멘트(강점/감점요인/개선포인트)를 제공하라."
 )
 
 CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
 
-def llm_generate_questions(clean: Dict, q_type: str, level: str, model: str, num: int = 8, seed: int = 0) -> List[str]:
+def llm_generate_questions_with_resume(clean: Dict, level: str, model: str, num: int = 8) -> List[str]:
+    # RAG에서 대표 스니펫 3~4개만 요약해 프롬프트에 주입
+    resume_snips = []
+    hits = retrieve_resume_chunks("핵심 프로젝트와 기술 스택 요약", k=4)
+    resume_snips = [t for _, t in hits]
+    resume_context = "\n".join([f"- {s[:350]}" for s in resume_snips])[:1200]
+
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {
         "role": "user",
         "content": (
             f"[회사/직무/요건]\n{ctx}\n\n"
-            f"[요청]\n- 질문 유형: {q_type}\n- 난이도/연차: {level}\n"
-            f"- 총 {num}개, 한 줄씩\n- 중복/유사도 최소화\n- 랜덤시드: {seed}"
+            f"[지원자 이력서 요약(발췌)]\n{resume_context}\n\n"
+            f"[요청]\n- 난이도/연차: {level}\n"
+            f"- 총 {num}개, 한 줄씩, 중복/유사도 최소화\n"
+            f"- 회사 요건과 이력서의 교집합/공백영역을 모두 겨냥해 질문 생성"
         ),
     }
     try:
@@ -307,29 +332,33 @@ def llm_generate_questions(clean: Dict, q_type: str, level: str, model: str, num
         txt = resp.choices[0].message.content.strip()
         lines = [re.sub(r'^\s*\d+[\).\s-]*','', l).strip() for l in txt.splitlines() if l.strip()]
         lines = [l for l in lines if len(l.split()) > 2][:num]
+        # 최근 질문과의 중복 간단 필터
         if "q_hist" in st.session_state:
-            hist = st.session_state.q_hist[-10:]
+            hist = st.session_state.q_hist[-12:]
             def sim(a,b):
                 a_set=set(a.lower().split()); b_set=set(b.lower().split())
                 inter=len(a_set&b_set); denom=max(1,len(a_set|b_set))
                 return inter/denom
             uniq=[]
             for q in lines:
-                if all(sim(q,h)<0.4 for h in hist):
+                if all(sim(q,h)<0.35 for h in hist):
                     uniq.append(q)
             if uniq: lines = uniq
         return lines[:num]
     except Exception:
         return []
 
-def llm_draft_answer(clean: Dict, question: str, resume_snips: List[str], model: str) -> str:
+def llm_draft_answer(clean: Dict, question: str, model: str) -> str:
+    # RAG 근거 포함 초안
+    hits = retrieve_resume_chunks(question, k=4)
+    resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
+
     ctx = json.dumps(clean, ensure_ascii=False)
-    resume_text = "\n".join([f"- {s[:400]}" for s in resume_snips])[:2000]
     user_msg = {
         "role": "user",
         "content": (
             f"[회사/직무/채용요건]\n{ctx}\n\n"
-            f"[지원자 이력서/프로젝트 요약]\n{resume_text}\n\n"
+            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
             f"[면접 질문]\n{question}\n\n"
             "위 정보를 근거로 STAR 기반 한국어 답변 **초안**을 작성해줘."
         )
@@ -343,14 +372,17 @@ def llm_draft_answer(clean: Dict, question: str, resume_snips: List[str], model:
     except Exception:
         return ""
 
-def llm_score_and_coach(clean: Dict, question: str, answer: str, resume_snips: List[str], model: str) -> Dict:
+def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: str) -> Dict:
+    # 더 깐깐한 채점: 근거/지표 미제시 강력 감점
+    hits = retrieve_resume_chunks(question + "\n" + answer[:800], k=4)
+    resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
+
     ctx = json.dumps(clean, ensure_ascii=False)
-    resume_text = "\n".join([f"- {s[:400]}" for s in resume_snips])[:1600]
     user_msg = {
         "role":"user",
         "content": (
             f"[회사/직무/채용요건]\n{ctx}\n\n"
-            f"[지원자 이력서/프로젝트 요약]\n{resume_text}\n\n"
+            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
             f"[면접 질문]\n{question}\n\n"
             f"[지원자 답변]\n{answer}\n\n"
             "다음 JSON 스키마로만 한국어 응답:\n"
@@ -372,7 +404,7 @@ def llm_score_and_coach(clean: Dict, question: str, answer: str, resume_snips: L
         resp = client.chat.completions.create(
             model=model, temperature=0.2,
             response_format={"type":"json_object"},
-            messages=[{"role":"system","content":PROMPT_SYSTEM_SCORE}, user_msg]
+            messages=[{"role":"system","content":PROMPT_SYSTEM_SCORE_STRICT}, user_msg]
         )
         data = json.loads(resp.choices[0].message.content)
         # 정합화
@@ -410,16 +442,24 @@ def llm_score_and_coach(clean: Dict, question: str, answer: str, resume_snips: L
 # ================== 세션 상태 ==================
 if "clean_struct" not in st.session_state:
     st.session_state.clean_struct = None
+if "resume_raw" not in st.session_state:
+    st.session_state.resume_raw = ""
+if "resume_chunks" not in st.session_state:
+    st.session_state.resume_chunks = []
+if "resume_embeds" not in st.session_state:
+    st.session_state.resume_embeds = None
 if "q_hist" not in st.session_state:
     st.session_state.q_hist = []
-if "records" not in st.session_state:
-    st.session_state.records = []
 if "current_question" not in st.session_state:
     st.session_state.current_question = ""
 if "answer_text" not in st.session_state:
     st.session_state.answer_text = ""
-if "rag_store" not in st.session_state:
-    st.session_state.rag_store = {"chunks": [], "embeds": None}
+if "records" not in st.session_state:
+    st.session_state.records = []
+if "followups" not in st.session_state:
+    st.session_state.followups = []
+if "selected_followup" not in st.session_state:
+    st.session_state.selected_followup = ""
 
 # ================== 1) 채용 공고 URL → 정제 ==================
 st.header("1) 채용 공고 URL → 정제")
@@ -465,92 +505,145 @@ else:
 
 st.divider()
 
-# ================== 3) 내 이력서/프로젝트 업로드(RAG) ==================
-st.header("3) 내 이력서/프로젝트 업로드 (RAG)")
-docs = st.file_uploader("이력서/프로젝트 설명 파일 업로드 (PDF/TXT/MD, 여러 개 가능)", type=["pdf","txt","md"], accept_multiple_files=True)
-rag_cols = st.columns(3)
-with rag_cols[0]:
-    chunk_size = st.number_input("청크 길이", value=900, min_value=300, max_value=2000, step=100)
-with rag_cols[1]:
-    chunk_overlap = st.number_input("오버랩", value=150, min_value=0, max_value=500, step=10)
-with rag_cols[2]:
-    top_k_rag = st.number_input("검색 상위 K", value=4, min_value=1, max_value=10, step=1)
+# ================== 3) 내 이력서/프로젝트 업로드 ==================
+st.header("3) 내 이력서/프로젝트 업로드 (PDF/TXT/MD/DOCX)")
+uploads = st.file_uploader(
+    "여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True
+)
+# 내부 기본 파라미터 (숨김)
+_RESUME_CHUNK = 600
+_RESUME_OVLP  = 120
+_TOPK_RAG     = 4
 
-if st.button("RAG 인덱싱", type="secondary"):
-    if not docs:
-        st.warning("파일을 업로드하세요.")
-    else:
-        chunks=[]
-        for up in docs:
-            t = read_file_text(up)
-            if t:
-                chunks += chunk(t, chunk_size, chunk_overlap)
-        if not chunks:
-            st.error("텍스트를 추출하지 못했습니다.")
+cols_idx = st.columns(2)
+with cols_idx[0]:
+    if st.button("이력서 인덱싱(자동)", type="secondary"):
+        if not uploads:
+            st.warning("파일을 업로드하세요.")
         else:
-            with st.spinner("임베딩 생성 중..."):
-                vecs = embed_texts(chunks)
-            st.session_state.rag_store["chunks"] = chunks
-            st.session_state.rag_store["embeds"] = vecs
-            st.success(f"인덱싱 완료 (청크 {len(chunks)}개)")
+            all_text=[]
+            for up in uploads:
+                t = read_file_text(up)
+                if t: all_text.append(t)
+            resume_text = "\n\n".join(all_text)
+            if not resume_text.strip():
+                st.error("텍스트를 추출하지 못했습니다.")
+            else:
+                chunks = chunk(resume_text, size=_RESUME_CHUNK, overlap=_RESUME_OVLP)
+                with st.spinner("이력서 벡터화 중..."):
+                    embeds = embed_texts(chunks, EMBED_MODEL)
+                st.session_state.resume_raw = resume_text
+                st.session_state.resume_chunks = chunks
+                st.session_state.resume_embeds = embeds
+                st.success(f"인덱싱 완료 (청크 {len(chunks)}개)")
+with cols_idx[1]:
+    st.caption("※ 청크/오버랩/Top-K 파라미터는 내부 기본값으로 자동 처리합니다.")
 
-# ================== 4) 질문 생성 & 초안 ==================
-st.header("4) 질문 생성 & 답변 초안")
-q_type = st.selectbox("질문 유형", ["행동(STAR)","기술 심층","핵심가치 적합성","역질문"], index=0)
+st.divider()
+
+# ================== 4) 자소서 생성 (Step1에서 추가된 기능 유지) ==================
+st.header("4) 이력서 기반 자소서 생성")
+topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
+
+def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, model: str) -> str:
+    company = json.dumps(clean_struct or {}, ensure_ascii=False)
+    resume_snippet = resume_text.strip()
+    if len(resume_snippet) > 9000:
+        resume_snippet = resume_snippet[:9000]
+    system = (
+        "너는 한국어 자기소개서 전문가다. 채용 공고의 회사/직무 요건과 후보자의 이력서를 참고해 "
+        "회사 특화 자소서를 작성한다. 과장/허위는 금지하고, 수치/지표/기간/임팩트 중심으로 구체화한다."
+    )
+    if topic_hint and topic_hint.strip():
+        req = f"회사 측 요청 주제는 '{topic_hint.strip()}' 이다. 이 주제를 중심으로 서술하라."
+    else:
+        req = "특정 주제 요청이 없으므로, 채용 공고의 요건을 중심으로 지원동기와 직무적합성을 강조하라."
+    user = (
+        f"[회사/직무 요약(JSON)]\n{company}\n\n"
+        f"[후보자 이력서(요약 가능)]\n{resume_snippet}\n\n"
+        f"[작성 지시]\n- {req}\n"
+        "- 분량: 600~900자\n"
+        "- 구성: 1) 지원 동기 2) 직무 관련 핵심 역량·경험 3) 성과/지표 4) 입사 후 기여 방안 5) 마무리\n"
+        "- 자연스럽고 진정성 있는 1인칭 서술. 문장과 문단 가독성을 유지.\n"
+        "- 불필요한 미사여구/중복/광고 문구 삭제."
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=model, temperature=0.4,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}]
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(자소서 생성 실패: {e})"
+
+if st.button("자소서 생성", type="primary"):
+    if not st.session_state.clean_struct:
+        st.warning("먼저 회사 URL을 정제하세요.")
+    elif not st.session_state.resume_raw.strip():
+        st.warning("먼저 이력서를 업로드하고 '이력서 인덱싱(자동)'을 눌러주세요.")
+    else:
+        with st.spinner("자소서 생성 중..."):
+            cover = build_cover_letter(st.session_state.clean_struct, st.session_state.resume_raw, topic, CHAT_MODEL)
+        st.subheader("자소서 (생성 결과)")
+        st.write(cover)
+        st.download_button("자소서 TXT 다운로드", data=cover.encode("utf-8"),
+                           file_name="cover_letter.txt", mime="text/plain")
+
+st.divider()
+
+# ================== 5) 질문 생성 & 답변 초안 (RAG 결합, 내부 시드/개수 숨김) ==================
+st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
 level  = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
-seed   = st.number_input("랜덤시드", value=int(time.time())%1_000_000, step=1)
-num    = st.slider("질문 개수", 4, 10, 8, 1)
 
-cqa = st.columns(2)
-with cqa[0]:
+# 내부 파라미터 (숨김)
+_Q_NUM  = 8
+_SEED   = int(time.time()*1000000) % 2_147_483_647
+
+cols_q = st.columns(2)
+with cols_q[0]:
     if st.button("새 질문 받기", type="primary"):
         if not st.session_state.clean_struct:
-            st.warning("먼저 URL을 정제하세요.")
+            st.warning("먼저 회사 URL을 정제하세요.")
         else:
-            qs = llm_generate_questions(st.session_state.clean_struct, q_type, level, CHAT_MODEL, num=num, seed=int(seed))
+            qs = llm_generate_questions_with_resume(st.session_state.clean_struct, level, CHAT_MODEL, num=_Q_NUM)
             if qs:
                 st.session_state.q_hist.extend(qs)
+                # 다양성 위해 랜덤 1개 선택
                 st.session_state.current_question = random.choice(qs)
                 st.session_state.answer_text = ""  # 이전 답변 초기화
                 st.success("질문 생성 완료!")
             else:
                 st.error("질문 생성 실패")
-with cqa[1]:
+with cols_q[1]:
     if st.button("RAG로 답변 초안 생성", type="secondary"):
         if not st.session_state.current_question:
             st.warning("먼저 질문을 생성하세요.")
         else:
-            snips = []
-            if st.session_state.rag_store.get("embeds") is not None:
-                hits = retrieve_resume_chunks(st.session_state.current_question, k=top_k_rag)
-                snips = [t for _, t in hits]
-            draft = llm_draft_answer(st.session_state.clean_struct, st.session_state.current_question, snips, CHAT_MODEL)
+            draft = llm_draft_answer(st.session_state.clean_struct, st.session_state.current_question, CHAT_MODEL)
             if draft:
                 st.session_state.answer_text = draft
                 st.success("초안 생성 완료!")
             else:
-                st.error("초안 생성 실패(컨텍스트 부족 가능)")
+                st.error("초안 생성 실패")
 
 st.text_area("질문", value=st.session_state.current_question, height=100)
 ans = st.text_area("나의 답변 (초안을 편집해 완성하세요)", height=200, key="answer_text")
 
-# ================== 5) 채점 & 코칭 (+ 팔로업 질문) ==================
-st.header("5) 채점 & 코칭")
+# ================== 6) 채점 & 코칭 (엄격 모드) + 팔로업 준비 ==================
+st.header("6) 채점 & 코칭 (엄격 모드)")
 if st.button("채점 & 코칭 실행", type="primary"):
     if not st.session_state.current_question:
         st.warning("먼저 질문을 생성하세요.")
     elif not st.session_state.answer_text.strip():
         st.warning("답변을 작성해 주세요.")
     else:
-        snips=[]
-        if st.session_state.rag_store.get("embeds") is not None:
-            hits = retrieve_resume_chunks(
-                st.session_state.current_question + "\n" + st.session_state.answer_text[:800],
-                k=top_k_rag
-            )
-            snips = [t for _, t in hits]
         with st.spinner("채점/코칭 중..."):
-            res = llm_score_and_coach(st.session_state.clean_struct, st.session_state.current_question, st.session_state.answer_text, snips, CHAT_MODEL)
+            res = llm_score_and_coach_strict(
+                st.session_state.clean_struct,
+                st.session_state.current_question,
+                st.session_state.answer_text,
+                CHAT_MODEL
+            )
         st.session_state.records.append({
             "question": st.session_state.current_question,
             "answer": st.session_state.answer_text,
@@ -563,7 +656,7 @@ if st.button("채점 & 코칭 실행", type="primary"):
         })
         st.success("채점/코칭 완료!")
 
-        # 팔로업 질문 3개 추가 제안
+        # 팔로업 질문 3개 제안 저장
         try:
             ctx = json.dumps(st.session_state.clean_struct, ensure_ascii=False)
             msg = {
@@ -572,19 +665,19 @@ if st.button("채점 & 코칭 실행", type="primary"):
                     f"[회사/직무/요건]\n{ctx}\n\n"
                     f"[지원자 답변]\n{st.session_state.answer_text}\n\n"
                     "면접관 관점에서 팔로업 질문 3개를 한 줄씩 한국어로 제안해줘. "
-                    "기존 질문과 중복되지 않게, 지표/리스크/트레이드오프를 섞어줘."
+                    "기존 질문과 중복되지 않게, 지표/리스크/트레이드오프/의사결정 근거를 섞어줘."
                 )
             }
-            r = client.chat.completions.create(model=CHAT_MODEL, temperature=0.7, messages=[{"role":"system","content":"면접 팔로업 생성기"}, msg])
-            followups = [re.sub(r'^\s*\d+[\).\s-]*','', l).strip() for l in r.choices[0].message.content.splitlines() if l.strip()]
-            st.markdown("**팔로업 질문 제안**")
-            for f in followups[:3]:
-                st.markdown(f"- {f}")
+            r = client.chat.completions.create(model=CHAT_MODEL, temperature=0.7,
+                                               messages=[{"role":"system","content":"면접 팔로업 생성기"}, msg])
+            followups = [re.sub(r'^\s*\d+[\).\s-]*','', l).strip()
+                         for l in r.choices[0].message.content.splitlines() if l.strip()]
+            st.session_state.followups = followups[:3]
         except Exception:
-            pass
+            st.session_state.followups = []
 
-# ================== 6) 피드백 결과 ==================
-st.header("6) 피드백 결과")
+# ================== 7) 피드백 결과 ==================
+st.header("7) 피드백 결과")
 if st.session_state.records:
     last = st.session_state.records[-1]
     left, right = st.columns([1,3])
@@ -611,69 +704,35 @@ else:
 
 st.divider()
 
-# ================== 7) 역량 레이더 (누적+평균) ==================
-st.header("7) 역량 레이더 (세션 누적)")
-def build_comp_table(records):
-    rows=[]
-    for idx, r in enumerate(records, 1):
-        crit = r.get("criteria", [])
-        row={"#": idx, "question": r.get("question",""), "overall": r.get("overall",0)}
-        cm = {c["name"]: c["score"] for c in crit if "name" in c}
-        for k in CRITERIA:
-            row[k] = cm.get(k, 0)
-        rows.append(row)
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["#","question","overall"]+CRITERIA)
+# ================== 8) 팔로업 질문 ▶ 답변 ▶ 피드백 ==================
+st.header("8) 팔로업 질문 ▶ 답변 ▶ 피드백")
+if st.session_state.followups:
+    st.markdown("**팔로업 질문 제안**")
+    for i, f in enumerate(st.session_state.followups, 1):
+        st.markdown(f"- ({i}) {f}")
+    st.session_state.selected_followup = st.selectbox(
+        "채점 받을 팔로업 질문 선택", st.session_state.followups, index=0
+    )
+    fu_ans = st.text_area("팔로업 질문에 대한 나의 답변", height=160, key="followup_answer")
 
-df = build_comp_table(st.session_state.records)
-if not df.empty:
-    avg = [float(df[k].mean()) for k in CRITERIA]
-    cum = [int(df[k].sum()) for k in CRITERIA]
-    try:
-        import plotly.graph_objects as go
-        radar = go.Figure()
-        radar.add_trace(go.Scatterpolar(
-            r=avg + [avg[0]], theta=CRITERIA + [CRITERIA[0]],
-            fill='toself', name='평균(0~20)'
-        ))
-        radar.add_trace(go.Scatterpolar(
-            r=cum + [cum[0]], theta=CRITERIA + [CRITERIA[0]],
-            fill='toself', name='누적(합계)'
-        ))
-        radar.update_layout(polar=dict(radialaxis=dict(visible=True)), showlegend=True, height=420)
-        st.plotly_chart(radar, use_container_width=True)
-    except Exception:
-        st.bar_chart(pd.DataFrame({"평균":avg,"누적":cum}, index=CRITERIA))
-    st.markdown("**세션 표(질문별 기준 점수)**")
-    st.dataframe(df, use_container_width=True)
-else:
-    st.caption("아직 누적 데이터가 없습니다. 질문 생성→답변→채점을 진행하세요.")
-
-st.divider()
-
-# ================== 8) 세션 저장/불러오기 ==================
-st.header("8) 세션 저장/불러오기")
-col_s = st.columns(2)
-with col_s[0]:
-    export = {
-        "clean_struct": st.session_state.clean_struct,
-        "q_hist": st.session_state.q_hist,
-        "records": st.session_state.records,
-    }
-    st.download_button("세션 저장(JSON)", data=json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8"),
-                       file_name="interview_session.json", mime="application/json")
-with col_s[1]:
-    up = st.file_uploader("세션 불러오기(JSON)", type=["json"], accept_multiple_files=False, key="sess_up")
-    if st.button("불러오기 실행", type="secondary"):
-        if up is None:
-            st.warning("JSON 파일을 올려주세요.")
+    if st.button("팔로업 채점 & 피드백", type="secondary"):
+        if not st.session_state.selected_followup:
+            st.warning("팔로업 질문을 선택하세요.")
+        elif not fu_ans.strip():
+            st.warning("팔로업 답변을 작성하세요.")
         else:
-            try:
-                data = json.loads(up.read().decode("utf-8"))
-                st.session_state.clean_struct = data.get("clean_struct")
-                st.session_state.q_hist = data.get("q_hist", [])
-                st.session_state.records = data.get("records", [])
-                st.success("세션 불러오기 완료!")
-            except Exception as e:
-                st.error(f"불러오기 실패: {e}")
-
-st.caption("총점은 기준(5×20) 합계와 항상 일치하도록 강제합니다. ‘새 질문 받기’ 클릭 시 답변란은 초기화됩니다.")
+            with st.spinner("팔로업 채점 중..."):
+                res_fu = llm_score_and_coach_strict(
+                    st.session_state.clean_struct,
+                    st.session_state.selected_followup,
+                    fu_ans, CHAT_MODEL
+                )
+            st.markdown("**팔로업 결과**")
+            st.metric("총점(/100)", res_fu.get("overall_score", 0))
+            for it in res_fu.get("criteria", []):
+                st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
+            if res_fu.get("revised_answer",""):
+                st.markdown("**팔로업 수정본 (STAR)**")
+                st.write(res_fu["revised_answer"])
+else:
+    st.caption("메인 질문을 채점하면 팔로업 질문이 자동으로 제안됩니다.")
