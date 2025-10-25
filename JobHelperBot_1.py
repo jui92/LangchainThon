@@ -2,7 +2,7 @@
 # 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다. #
 ##############################################################################################
 
-# -*- coding: utf-8 -*-
+# Library Import ( coding: utf-8 )
 import os, re, json, urllib.parse, random, time, io
 from typing import Optional, Tuple, Dict, List
 
@@ -409,3 +409,4 @@ if st.button("자소서 생성", type="primary"):
             file_name="cover_letter.txt",
             mime="text/plain"
         )
+
