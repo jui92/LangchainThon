@@ -304,13 +304,17 @@ if clean:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**주요 업무**")
-        for b in clean.get("responsibilities", []): st.markdown(f"- {b}")
+        for b in clean.get("주요업무", []): st.markdown(f"- {b}")
     with c2:
         st.markdown("**자격 요건**")
-        for b in clean.get("qualifications", []): st.markdown(f"- {b}")
+        for b in clean.get("자격요건", []): st.markdown(f"- {b}")
     with c3:
         st.markdown("**우대 사항**")
-        for b in clean.get("qualifications", []): st.markdown(f"- {b}")
+        prefs = clean.get("우대사항", [])
+        if prefs:
+            for b in prefs: st.markdown(f"- {b}")
+        else:
+            st.caption("우대 사항이 명시되지 않았습니다.")
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
