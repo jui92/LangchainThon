@@ -11,3 +11,4 @@ langchain-community>=0.2.0
 wikipedia>=1.4.0
 lxml
 html2text
+docx2txt 
