@@ -1,794 +1,474 @@
-# -*- coding: utf-8 -*-
-import os, re, json, urllib.parse, time, io, random
-from typing import Optional, Tuple, Dict, List
+# filename: interview_coach_bot.py
+import os, io, re, json, textwrap, time, difflib, urllib.parse, random
+from typing import List, Dict, Tuple, Optional
 
+import numpy as np
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import html2text
 import streamlit as st
-import pandas as pd
-import numpy as np
 
-# ================== 기본 설정 ==================
-st.set_page_config(page_title="회사 맞춤 면접 코치 (Step2+팔로업 인라인)", page_icon="🎯", layout="wide")
-st.title("회사 맞춤 면접 코치 · URL 정제 → 자소서 → 질문/RAG/채점 → (피드백 아래) 팔로업")
-
-# ================== OpenAI ==================
-try:
-    from openai import OpenAI
-except ImportError:
-    st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
-    st.stop()
-
-API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
-if not API_KEY:
-    API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
-if not API_KEY:
-    st.stop()
-client = OpenAI(api_key=API_KEY)
-
-with st.sidebar:
-    st.subheader("모델 설정")
-    CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
-    EMBED_MODEL = st.selectbox("임베딩 모델(내부용)", ["text-embedding-3-small","text-embedding-3-large"], index=0)
-
-# ================== HTTP 유틸 ==================
-def normalize_url(u: str) -> Optional[str]:
-    if not u: return None
-    u = u.strip()
-    if not re.match(r"^https?://", u): u = "https://" + u
-    parts = urllib.parse.urlsplit(u)
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
-
-def http_get(url: str, timeout: int = 12) -> Optional[requests.Response]:
-    try:
-        r = requests.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-                "Accept-Language": "ko, en;q=0.9",
-            },
-            timeout=timeout,
-        )
-        if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
-            return r
-    except Exception:
-        pass
-    return None
-
-# ================== 원문 수집 (Jina → Web → BS4) ==================
-def fetch_jina_text(url: str, timeout: int = 15) -> str:
-    try:
-        parts = urllib.parse.urlsplit(url)
-        prox = f"https://r.jina.ai/http://{parts.netloc}{parts.path}"
-        if parts.query: prox += f"?{parts.query}"
-        r = http_get(prox, timeout=timeout)
-        return r.text.strip() if r else ""
-    except Exception:
-        return ""
-
-def html_to_text(html_str: str) -> str:
-    conv = html2text.HTML2Text()
-    conv.ignore_links = True
-    conv.ignore_images = True
-    conv.body_width = 0
-    txt = conv.handle(html_str)
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    return txt.strip()
-
-def fetch_webbase_text(url: str) -> str:
-    r = http_get(url, timeout=12)
-    if not r: return ""
-    return html_to_text(r.text)
-
-def fetch_bs4_text(url: str) -> Tuple[str, Optional[BeautifulSoup]]:
-    r = http_get(url, timeout=12)
-    if not r: return "", None
-    soup = BeautifulSoup(r.text, "lxml")
-    blocks = []
-    for sel in ["article","section","main","div","ul","ol"]:
-        for el in soup.select(sel):
-            txt = el.get_text(" ", strip=True)
-            if txt and len(txt) > 300:
-                txt = re.sub(r"\s+"," ", txt)
-                blocks.append(txt)
-    if not blocks:
-        return soup.get_text(" ", strip=True)[:120000], soup
-    seen, out = set(), []
-    for b in blocks:
-        if b not in seen:
-            seen.add(b); out.append(b)
-    return ("\n\n".join(out)[:120000], soup)
-
-def fetch_all_text(url: str):
-    url = normalize_url(url)
-    if not url: return "", {"error":"invalid_url"}, None
-    jina = fetch_jina_text(url)
-    if jina:
-        _, soup = fetch_bs4_text(url)
-        return jina, {"source":"jina","len":len(jina),"url_final":url}, soup
-    web = fetch_webbase_text(url)
-    if web:
-        _, soup = fetch_bs4_text(url)
-        return web, {"source":"webbase","len":len(web),"url_final":url}, soup
-    bs, soup = fetch_bs4_text(url)
-    return bs, {"source":"bs4","len":len(bs),"url_final":url}, soup
-
-# ================== 메타/섹션 보조 추출 ==================
-def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str,str]:
-    meta = {"company_name":"","company_intro":"","job_title":""}
-    if not soup: return meta
-    cand = []
-    og = soup.find("meta", {"property":"og:site_name"})
-    if og and og.get("content"): cand.append(og["content"])
-    app = soup.find("meta", {"name":"application-name"})
-    if app and app.get("content"): cand.append(app["content"])
-    if soup.title and soup.title.string: cand.append(soup.title.string)
-    cand = [re.split(r"[\-\|\·\—]", c)[0].strip() for c in cand if c]
-    cand = [c for c in cand if 2 <= len(c) <= 40]
-    meta["company_name"] = cand[0] if cand else ""
-    md = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
-    if md and md.get("content"):
-        meta["company_intro"] = re.sub(r"\s+"," ", md["content"]).strip()[:500]
-    jt = ""
-    ogt = soup.find("meta", {"property":"og:title"})
-    if ogt and ogt.get("content"): jt = ogt["content"]
-    if not jt:
-        h1 = soup.find("h1")
-        if h1 and h1.get_text(): jt = h1.get_text(strip=True)
-    if not jt:
-        h2 = soup.find("h2")
-        if h2 and h2.get_text(): jt = h2.get_text(strip=True)
-    meta["job_title"] = re.sub(r"\s+"," ", jt).strip()[:120]
-    return meta
-
-# ================== 규칙 파서 (우대 사항 보정) ==================
-def rule_based_sections(raw_text: str) -> dict:
-    txt = re.sub(r"\r", "", raw_text or "").strip()
-    lines = [re.sub(r"\s+", " ", l).strip(" -•·▶▪️") for l in txt.split("\n")]
-    lines = [l for l in lines if l]
-
-    hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
-    hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
-    hdr_pref = re.compile(r"(우대\s*사항|우대|Preferred|Nice\s*to\s*have|Plus)", re.I)
-
-    bucket = None
-    out = {"responsibilities": [], "qualifications": [], "preferences": []}
-
-    def push(line, b):
-        if line and len(line) > 1 and line not in out[b]:
-            out[b].append(line[:180])
-
-    for l in lines:
-        if hdr_resp.search(l): bucket = "responsibilities"; continue
-        if hdr_qual.search(l): bucket = "qualifications"; continue
-        if hdr_pref.search(l): bucket = "preferences"; continue
-
-        if bucket is None:
-            if hdr_pref.search(l):
-                bucket = "preferences"
-            elif any(k in l.lower() for k in ["java","python","spark","airflow","kafka","ml","sql"]):
-                bucket = "responsibilities"
-            else:
-                continue
-        push(l, bucket)
-
-    kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
-    remain_qual = []
-    for q in out["qualifications"]:
-        if kw_pref.search(q):
-            out["preferences"].append(q)
-        else:
-            remain_qual.append(q)
-    out["qualifications"] = remain_qual
-
-    for k in out:
-        seen=set(); clean=[]
-        for s in out[k]:
-            s = re.sub(r"\s+", " ", s).strip(" -•·▶▪️").strip()
-            if s and s not in seen:
-                seen.add(s); clean.append(s)
-        out[k] = clean[:12]
-    return out
-
-# ================== LLM 정제 (채용 공고 → 구조 JSON) ==================
-PROMPT_SYSTEM_STRUCT = (
-    "너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
-    "입력 텍스트는 포털 광고 문구, UI잔재, 복수 직무가 섞여 있을 수 있다. "
-    "한국어로 간결하고 중복없이 정제하라."
-)
-
-def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
-    ctx = (raw_text or "").strip()
-    if len(ctx) > 14000:
-        ctx = ctx[:14000]
-
-    user_msg = {
-        "role": "user",
-        "content": (
-            "다음 채용 공고 원문을 구조화해줘.\n\n"
-            f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
-            f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
-            "--- 원문 시작 ---\n"
-            f"{ctx}\n"
-            "--- 원문 끝 ---\n\n"
-            "JSON으로만 답하고, 키는 반드시 아래만 포함:\n"
-            "{"
-            "\"company_name\": str, "
-            "\"company_intro\": str, "
-            "\"job_title\": str, "
-            "\"responsibilities\": [str], "
-            "\"qualifications\": [str], "
-            "\"preferences\": [str]"
-            "}\n"
-            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/Preferred/Nice to have/Plus' 등 표시가 있는 항목을 그대로 담아라.\n"
-            "- 불릿/마커/이모지 제거, 문장 간결화, 중복 제거."
-        ),
-    }
-
-    try:
-        resp = client.chat.completions.create(
-            model=model, temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg],
-        )
-        data = json.loads(resp.choices[0].message.content)
-    except Exception as e:
-        data = {
-            "company_name": meta_hint.get("company_name",""),
-            "company_intro": meta_hint.get("company_intro","원문이 정제되지 않았습니다."),
-            "job_title": meta_hint.get("job_title",""),
-            "responsibilities": [],
-            "qualifications": [],
-            "preferences": [],
-            "error": str(e),
-        }
-
-    for k in ["responsibilities","qualifications","preferences"]:
-        arr = data.get(k, [])
-        if not isinstance(arr, list): arr = []
-        clean=[]; seen=set()
-        for it in arr:
-            t = re.sub(r"\s+"," ", str(it)).strip(" -•·▶▪️").strip()
-            if t and t not in seen:
-                seen.add(t); clean.append(t[:180])
-        data[k] = clean[:12]
-
-    for k in ["company_name","company_intro","job_title"]:
-        if k in data and isinstance(data[k], str):
-            data[k] = re.sub(r"\s+"," ", data[k]).strip()
-
-    if len(data.get("preferences", [])) < 1:
-        rb = rule_based_sections(ctx)
-        if rb.get("preferences"):
-            merged = data.get("preferences", []) + rb["preferences"]
-            seen=set(); pref=[]
-            for s in merged:
-                s=s.strip()
-                if s and s not in seen:
-                    seen.add(s); pref.append(s)
-            data["preferences"] = pref[:12]
-        if not data["preferences"]:
-            kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
-            remain=[]; moved=[]
-            for q in data.get("qualifications", []):
-                if kw_pref.search(q): moved.append(q)
-                else: remain.append(q)
-            if moved:
-                data["preferences"] = moved[:12]
-                data["qualifications"] = remain[:12]
-    return data
-
-# ================== 파일 리더 (PDF/TXT/MD/DOCX) ==================
+# Optional deps
 try:
     import pypdf
 except Exception:
     pypdf = None
 
-def read_pdf(data: bytes) -> str:
-    if pypdf is None:
-        return ""
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(data))
-        return "\n\n".join([(reader.pages[i].extract_text() or "") for i in range(len(reader.pages))])
-    except Exception:
-        return ""
+try:
+    import plotly.graph_objects as go
+    PLOTLY_OK = True
+except Exception:
+    PLOTLY_OK = False
 
-def read_docx(data: bytes) -> str:
-    try:
-        import docx2txt, tempfile
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
-            tmp.write(data); tmp.flush()
-            text = docx2txt.process(tmp.name) or ""
-            return text
-    except Exception:
-        return ""
+# OpenAI
+try:
+    from openai import OpenAI
+except Exception as e:
+    st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
+    st.stop()
 
-def read_file_text(uploaded) -> str:
-    name = uploaded.name.lower()
-    data = uploaded.read()
-    if name.endswith((".txt",".md")):
+# ------------------ helpers ------------------
+def _clean(t:str)->str:
+    return re.sub(r"\s+"," ", t or "").strip()
+
+def _snippet(t:str, n:int=220)->str:
+    t=_clean(t); return t if len(t)<=n else t[:n-1]+"…"
+
+def load_api_key()->Optional[str]:
+    k=os.getenv("OPENAI_API_KEY")
+    if k: return k
+    try:
+        return st.secrets.get("OPENAI_API_KEY", None)
+    except Exception:
+        return None
+
+def read_upload(f)->str:
+    name=(f.name or "").lower()
+    data=f.read()
+    if name.endswith((".txt",".md",".csv",".log")):
         for enc in ("utf-8","cp949","euc-kr"):
             try: return data.decode(enc)
-            except Exception: continue
+            except Exception: pass
         return data.decode("utf-8", errors="ignore")
-    elif name.endswith(".pdf"):
-        return read_pdf(data)
-    elif name.endswith(".docx"):
-        return read_docx(data)
+    if name.endswith(".pdf"):
+        if pypdf is None:
+            return ""
+        try:
+            reader=pypdf.PdfReader(io.BytesIO(data))
+            return "\n\n".join([(reader.pages[i].extract_text() or "") for i in range(len(reader.pages))])
+        except Exception:
+            return ""
+    if name.endswith(".docx"):
+        # 매우 경량 파서 (python-docx 없이): 실패 시 안내
+        try:
+            import zipfile, xml.etree.ElementTree as ET
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml=z.read("word/document.xml")
+            root=ET.fromstring(xml)
+            ns={"w":"http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            texts=[]
+            for node in root.findall(".//w:t", ns):
+                texts.append(node.text or "")
+            return "\n".join(texts)
+        except Exception:
+            return ""
     return ""
 
-# ================== 간단 청크/임베딩(내부 자동) ==================
-def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
-    t = re.sub(r"\s+"," ", text).strip()
+def chunk_text(t:str, size:int=800, overlap:int=120)->List[str]:
+    t=re.sub(r"\s+"," ", t or "").strip()
     if not t: return []
-    out, start = [], 0
-    while start < len(t):
-        end = min(len(t), start+size)
-        out.append(t[start:end])
-        if end == len(t): break
-        start = max(0, end-overlap)
+    out=[]; i=0
+    while i<len(t):
+        j=min(len(t), i+size)
+        out.append(t[i:j])
+        if j==len(t): break
+        i=max(0, j-overlap)
     return out
 
-def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
-    if not texts:
-        return np.zeros((0, 1536), dtype=np.float32)
-    resp = client.embeddings.create(model=model_name, input=texts)
-    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-    return vecs
+# ------------------ OpenAI ------------------
+API_KEY=load_api_key()
+if not API_KEY:
+    st.error("OpenAI API 키가 필요합니다. (Secrets 또는 환경변수 OPENAI_API_KEY)")
+    st.stop()
+client=OpenAI(api_key=API_KEY)
 
-def cosine_topk(matrix: np.ndarray, query_vec: np.ndarray, k: int = 4):
-    if matrix.size == 0:
-        return np.array([]), np.array([], dtype=int)
-    qn = query_vec / (np.linalg.norm(query_vec, axis=1, keepdims=True) + 1e-12)
-    mn = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
-    sims = mn @ qn.T
-    sims = sims.reshape(-1)
-    idx = np.argsort(-sims)[:k]
+DEFAULT_MODEL="gpt-4o-mini"
+EMBED_MODEL="text-embedding-3-small"
+
+def embed(texts:List[str])->np.ndarray:
+    if not texts: return np.zeros((0,1536), dtype=np.float32)
+    r=client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return np.array([d.embedding for d in r.data], dtype=np.float32)
+
+def cosine_topk(matrix:np.ndarray, query:np.ndarray, k:int=4):
+    if matrix.size==0: return np.array([]), np.array([], dtype=int)
+    qn=query/(np.linalg.norm(query,axis=1,keepdims=True)+1e-12)
+    mn=matrix/(np.linalg.norm(matrix,axis=1,keepdims=True)+1e-12)
+    sims=(mn@qn.T).reshape(-1)
+    idx=np.argsort(-sims)[:k]
     return sims[idx], idx
 
-def retrieve_resume_chunks(query: str, k: int = 4):
-    chs, embs = st.session_state.get("resume_chunks", []), st.session_state.get("resume_embeds", None)
-    if not chs or embs is None:
+# ------------------ Company from job URL (정제용 최소 형태) ------------------
+SECTION_HEADS=[
+    ("주요 업무", ["주요 업무","담당 업무","업무","What you will do","Responsibilities"]),
+    ("자격 요건", ["자격 요건","지원 자격","Requirements","Qualifications","Must have"]),
+    ("우대 사항", ["우대","우대 사항","Preferred","Nice to have"]),
+]
+
+def fetch_html(url:str)->BeautifulSoup|None:
+    try:
+        r=requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code!=200 or "text/html" not in r.headers.get("content-type",""): return None
+        return BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return None
+
+def extract_sections_from_job(soup:BeautifulSoup)->dict:
+    out={"title":None,"responsibilities":[],"qualifications":[],"preference":[]}
+    if soup is None: return out
+    # title
+    if soup.title and soup.title.string:
+        out["title"]=_clean(soup.title.string)
+
+    # JSON-LD 우선
+    for s in soup.find_all("script", {"type":"application/ld+json"}):
+        try:
+            data=json.loads(s.string or "")
+            lst=data if isinstance(data,list) else [data]
+            for obj in lst:
+                t=obj.get("@type")
+                if (isinstance(t,list) and "JobPosting" in t) or t=="JobPosting":
+                    desc=_clean(obj.get("description",""))
+                    if desc:
+                        # 라인 분리
+                        bullets=[x.strip(" -•·▪︎▶") for x in re.split(r"[•\-\n•·▪︎▶]+", desc) if len(x.strip())>3]
+                        # 대강 분류
+                        for b in bullets:
+                            low=b.lower()
+                            if any(k in low for k in ["우대","preferred","nice to have"]):
+                                out["preference"].append(b)
+                            elif any(k in low for k in ["자격","require","qualif"]):
+                                out["qualifications"].append(b)
+                            else:
+                                out["responsibilities"].append(b)
+        except Exception:
+            pass
+
+    # 헤더 기반 추가 보강
+    def harvest(keys):
+        # 헤더부터 다음 헤더 직전까지 텍스트 수집
+        for h in soup.find_all(re.compile("^h[1-4]$")):
+            head=_clean(h.get_text())
+            if not head: continue
+            if any(k.lower() in head.lower() for k in keys):
+                texts=[]
+                sib=h.find_next_sibling()
+                while sib and sib.name not in {"h1","h2","h3","h4"}:
+                    if sib.name in {"p","li","ul","ol","div","section"}:
+                        tx=_clean(sib.get_text(" "))
+                        if len(tx)>5: texts.append(tx)
+                    sib=sib.find_next_sibling()
+                joined=" ".join(texts)
+                if joined:
+                    items=[x.strip(" -•·▪︎▶") for x in re.split(r"[•\-\n•·▪︎▶]+", joined) if len(x.strip())>3]
+                    return items[:20]
         return []
-    qv = embed_texts([query], EMBED_MODEL)
-    scores, idxs = cosine_topk(embs, qv, k=k)
-    return [(float(s), chs[int(i)]) for s, i in zip(scores, idxs)]
+    if not out["responsibilities"]:
+        out["responsibilities"]=harvest(SECTION_HEADS[0][1])
+    if not out["qualifications"]:
+        out["qualifications"]=harvest(SECTION_HEADS[1][1])
+    if not out["preference"]:
+        out["preference"]=harvest(SECTION_HEADS[2][1])
 
-# ================== 질문/초안/채점/팔로업 프롬프트 ==================
-PROMPT_SYSTEM_Q = (
-    "너는 채용담당자다. 회사/직무 맥락과 채용요건, 그리고 지원자의 이력서 요약을 함께 고려해 "
-    "면접 질문을 한국어로 생성한다. 질문은 서로 형태·관점·키워드가 겹치지 않게 다양화하고, "
-    "수치/지표/기간/규모/리스크/트레이드오프 등도 섞어라."
-)
-PROMPT_SYSTEM_DRAFT = (
-    "너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서 요약을 결합해 "
-    "질문에 대한 답변 **초안**을 STAR(상황-과제-행동-성과)로 8~12문장, 한국어로 작성한다. "
-    "가능하면 구체적인 지표/수치/기간/임팩트를 포함하라."
-)
-PROMPT_SYSTEM_SCORE_STRICT = (
-    "너는 매우 엄격한 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
-    "각 기준은 0~20 정수이며, 총점은 기준 합계(최대 100)와 반드시 일치해야 한다. "
-    "과장/모호함/근거 부재/숫자 없는 주장/책임 회피/모호한 주어 사용 등을 강하게 감점하라. "
-    "각 기준에 대해 짧지만 구체적 코멘트(강점/감점요인/개선포인트)를 제공하라."
-)
-CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
+    # 길이 제한
+    out["responsibilities"]=[_snippet(x,140) for x in out["responsibilities"]][:12]
+    out["qualifications"]=[_snippet(x,140) for x in out["qualifications"]][:12]
+    out["preference"]=[_snippet(x,140) for x in out["preference"]][:12]
+    return out
 
-def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str) -> str:
-    # 이력서 스니펫 결합 (Top-k 발췌)
-    hits = retrieve_resume_chunks("핵심 프로젝트와 기술 스택 요약", k=4)
-    resume_snips = [t for _, t in hits]
-    resume_context = "\n".join([f"- {s[:350]}" for s in resume_snips])[:1200]
-
-    ctx = json.dumps(clean, ensure_ascii=False)
-    user_msg = {
-        "role": "user",
-        "content": (
-            f"[회사/직무/요건]\n{ctx}\n\n"
-            f"[지원자 이력서 요약(발췌)]\n{resume_context}\n\n"
-            f"[요청]\n- 난이도/연차: {level}\n"
-            f"- 중복/유사도 지양, 회사 요건과 이력서의 교집합 또는 공백영역을 겨냥\n"
-            f"- 한국어 면접 질문 1개만 한 줄로 출력"
-        ),
-    }
-    try:
-        resp = client.chat.completions.create(
-            model=model, temperature=0.85,
-            messages=[{"role":"system","content":PROMPT_SYSTEM_Q}, user_msg],
-        )
-        q = resp.choices[0].message.content.strip()
-        q = re.sub(r"^\s*\d+[\).\s-]*","", q).strip()
-        q = q.split("\n")[0].strip()
-        return q
-    except Exception:
-        return ""
-
-def llm_draft_answer(clean: Dict, question: str, model: str) -> str:
-    hits = retrieve_resume_chunks(question, k=4)
-    resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
-    ctx = json.dumps(clean, ensure_ascii=False)
-    user_msg = {
-        "role": "user",
-        "content": (
-            f"[회사/직무/채용요건]\n{ctx}\n\n"
-            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
-            f"[면접 질문]\n{question}\n\n"
-            "위 정보를 근거로 STAR 기반 한국어 답변 **초안**을 작성해줘."
-        )
-    }
-    try:
-        resp = client.chat.completions.create(
-            model=model, temperature=0.5,
-            messages=[{"role":"system","content":PROMPT_SYSTEM_DRAFT}, user_msg],
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return ""
-
-def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: str) -> Dict:
-    hits = retrieve_resume_chunks(question + "\n" + answer[:800], k=4)
-    resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
-    ctx = json.dumps(clean, ensure_ascii=False)
-    user_msg = {
-        "role":"user",
-        "content": (
-            f"[회사/직무/채용요건]\n{ctx}\n\n"
-            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
-            f"[면접 질문]\n{question}\n\n"
-            f"[지원자 답변]\n{answer}\n\n"
-            "다음 JSON 스키마로만 한국어 응답:\n"
-            "{"
-            "\"overall_score\": 0~100 정수,"
-            "\"criteria\": [{\"name\":\"문제정의\",\"score\":0~20,\"comment\":\"...\"},"
-            "{\"name\":\"데이터/지표\",\"score\":0~20,\"comment\":\"...\"},"
-            "{\"name\":\"실행력/주도성\",\"score\":0~20,\"comment\":\"...\"},"
-            "{\"name\":\"협업/커뮤니케이션\",\"score\":0~20,\"comment\":\"...\"},"
-            "{\"name\":\"고객가치\",\"score\":0~20,\"comment\":\"...\"}],"
-            "\"strengths\": [\"...\", \"...\"],"
-            "\"risks\": [\"...\", \"...\"],"
-            "\"improvements\": [\"...\", \"...\", \"...\"],"
-            "\"revised_answer\": \"STAR 구조로 간결히\""
-            "}"
-        )
-    }
-    try:
-        resp = client.chat.completions.create(
-            model=model, temperature=0.2,
-            response_format={"type":"json_object"},
-            messages=[{"role":"system","content":PROMPT_SYSTEM_SCORE_STRICT}, user_msg]
-        )
-        data = json.loads(resp.choices[0].message.content)
-        # 정합화
-        crit = data.get("criteria", [])
-        fixed=[]
-        for name in CRITERIA:
-            found=None
-            for it in crit:
-                if str(it.get("name","")).strip()==name:
-                    found=it; break
-            if not found: found={"name":name,"score":0,"comment":""}
-            sc = int(found.get("score",0)); sc=max(0,min(20,sc))
-            found["score"]=sc; found["comment"]=str(found.get("comment","")).strip()
-            fixed.append(found)
-        total=sum(x["score"] for x in fixed)
-        data["criteria"]=fixed
-        data["overall_score"]=total
-        for k in ["strengths","risks","improvements"]:
-            arr=data.get(k,[]); 
-            if not isinstance(arr,list): arr=[]
-            data[k]=[str(x).strip() for x in arr if str(x).strip()][:5]
-        data["revised_answer"]=str(data.get("revised_answer","")).strip()
-        return data
-    except Exception as e:
-        return {
-            "overall_score": 0,
-            "criteria": [{"name": n, "score": 0, "comment": ""} for n in CRITERIA],
-            "strengths": [],
-            "risks": [],
-            "improvements": [],
-            "revised_answer": "",
-            "error": str(e),
-        }
-
-# ================== 세션 상태 ==================
-def _init_state():
-    for k, v in {
-        "clean_struct": None,
-        "resume_raw": "",
-        "resume_chunks": [],
-        "resume_embeds": None,
-        "current_question": "",
-        "answer_text": "",
-        "records": [],
-        "followups": [],
-        "selected_followup": "",
-        "followup_answer": "",
-        "last_result": None,          # 마지막 채점 결과(JSON)
-        "last_followup_result": None  # 마지막 팔로업 채점 결과(JSON)
-    }.items():
-        if k not in st.session_state: st.session_state[k] = v
-_init_state()
+# ------------------ 페이지 설정 ------------------
+st.set_page_config(page_title="지원 회사 특화 면접 코치", page_icon="🎯", layout="wide")
 
 # ================== 1) 채용 공고 URL → 정제 ==================
 st.header("1) 채용 공고 URL → 정제")
-url = st.text_input("채용 공고 상세 URL", placeholder="예: https://www.wanted.co.kr/wd/123456")
+job_url=st.text_input("채용 공고 상세 URL", placeholder="https://... (원티드/사람인/잡코리아 등)")
+
+company_state=st.session_state.setdefault("company_state", {})
 if st.button("원문 수집 → 정제", type="primary"):
-    if not url.strip():
-        st.warning("URL을 입력하세요.")
-    else:
-        with st.spinner("원문 수집 중..."):
-            raw, meta, soup = fetch_all_text(url.strip())
-            hint = extract_company_meta(soup)
-        if not raw:
-            st.error("원문을 가져오지 못했습니다. (로그인/동적 렌더링/봇 차단 가능)")
-        else:
-            with st.spinner("LLM으로 정제 중..."):
-                clean = llm_structurize(raw, hint, CHAT_MODEL)
-            # 우대사항 최종 방어막
-            if not clean.get("preferences"):
-                rb = rule_based_sections(raw)
-                if rb.get("preferences"):
-                    clean["preferences"] = rb["preferences"][:12]
-            st.session_state.clean_struct = clean
-            st.success("정제 완료!")
+    soup=fetch_html(job_url) if job_url else None
+    jp=extract_sections_from_job(soup) if soup else {"title":None,"responsibilities":[],"qualifications":[],"preference":[]}
+    company_state["job_url"]=job_url or None
+    company_state["role_title"]=jp.get("title")
+    company_state["responsibilities"]=jp.get("responsibilities",[])
+    company_state["qualifications"]=jp.get("qualifications",[])
+    company_state["preference"]=jp.get("preference",[])
+    st.success("정제 완료")
 
 # ================== 2) 회사 요약 (정제 결과) ==================
 st.header("2) 회사 요약 (정제 결과)")
-clean = st.session_state.clean_struct
-if clean:
-    st.markdown(f"**회사명:** {clean.get('company_name','-')}")
-    st.markdown(f"**간단한 회사 소개(요약):** {clean.get('company_intro','-')}")
-    st.markdown(f"**모집 분야(직무명):** {clean.get('job_title','-')}")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**주요 업무**")
-        for b in clean.get("responsibilities", []): st.markdown(f"- {b}")
-    with c2:
-        st.markdown("**자격 요건**")
-        for b in clean.get("qualifications", []): st.markdown(f"- {b}")
-    with c3:
-        st.markdown("**우대 사항**")
-        prefs = clean.get("preferences", [])
-        if prefs:
-            for b in prefs: st.markdown(f"- {b}")
-        else:
-            st.caption("우대 사항이 명시되지 않았습니다.")
-else:
-    st.info("먼저 URL을 정제해 주세요.")
+c = company_state
+colA,colB=st.columns([2,1])
+with colA:
+    st.markdown(f"**회사명:**  {_clean(c.get('company_name') or '') or '—'}")
+with colB:
+    st.markdown(f"**모집 분야(직무명):**  {_snippet(c.get('role_title') or '') or '—'}")
 
-st.divider()
+st.markdown("**간단한 회사 소개(요약)**")
+st.write(_snippet(c.get("company_intro_site") or "채용 공고 상의 소개나 메타 설명이 없으면 공란일 수 있습니다.", 500))
 
-# ================== 3) 내 이력서/프로젝트 업로드 (PDF/TXT/MD/DOCX) ==================
+col1,col2,col3=st.columns(3)
+with col1:
+    st.subheader("주요 업무")
+    rs=c.get("responsibilities",[]) or ["(공고에서 추출된 주요 업무가 없습니다.)"]
+    st.markdown("\n".join([f"- {x}" for x in rs]))
+with col2:
+    st.subheader("자격 요건")
+    qs=c.get("qualifications",[]) or ["(공고에서 추출된 자격 요건이 없습니다.)"]
+    st.markdown("\n".join([f"- {x}" for x in qs]))
+with col3:
+    st.subheader("우대 사항")
+    ps=c.get("preference",[]) or ["(공고에서 추출된 우대 사항이 없습니다.)"]
+    st.markdown("\n".join([f"- {x}" for x in ps]))
+
+with st.expander("디버그: 공고 요약 상태"):
+    lens={}
+    if job_url:
+        soup=fetch_html(job_url)
+        if soup:
+            # 단순 길이 지표
+            bs4_len=len(_clean(soup.get_text(" ") or ""))
+            lens["bs4"]=bs4_len
+            lens["webbase"]=bs4_len  # 자리표시자
+    st.json({
+        "job_url": job_url,
+        "lens": lens,
+        "resp_cnt": len(c.get("responsibilities") or []),
+        "qual_cnt": len(c.get("qualifications") or []),
+        "pref_cnt": len(c.get("preference") or []),
+    })
+
+# ================== 3) 내 이력서/프로젝트 업로드 (RAG 인덱싱) ==================
 st.header("3) 내 이력서/프로젝트 업로드")
-uploads = st.file_uploader(
-    "여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True
-)
-# 내부 기본 파라미터 (UI 비노출)
-_RESUME_CHUNK = 600
-_RESUME_OVLP  = 120
+uploaded=st.file_uploader("이력서/프로젝트 파일 추가 (PDF/TXT/MD/DOCX 가능, 여러 개 업로드)",
+                          type=["pdf","txt","md","docx"], accept_multiple_files=True)
 
-cols_idx = st.columns(2)
-with cols_idx[0]:
-    if st.button("이력서 인덱싱(자동)", type="secondary"):
-        if not uploads:
-            st.warning("파일을 업로드하세요.")
+rag = st.session_state.setdefault("rag", {"chunks":[], "embeds":None})
+if uploaded:
+    texts=[]
+    for f in uploaded:
+        t=read_upload(f)
+        if t: texts+=chunk_text(t, size=700, overlap=100)
+    if texts:
+        vec=embed(texts)
+        if rag["embeds"] is None or rag["embeds"].size==0:
+            rag["chunks"]=texts
+            rag["embeds"]=vec
         else:
-            all_text=[]
-            for up in uploads:
-                t = read_file_text(up)
-                if t: all_text.append(t)
-            resume_text = "\n\n".join(all_text)
-            if not resume_text.strip():
-                st.error("텍스트를 추출하지 못했습니다.")
-            else:
-                chunks = chunk(resume_text, size=_RESUME_CHUNK, overlap=_RESUME_OVLP)
-                with st.spinner("이력서 벡터화 중..."):
-                    embeds = embed_texts(chunks, EMBED_MODEL)
-                st.session_state.resume_raw = resume_text
-                st.session_state.resume_chunks = chunks
-                st.session_state.resume_embeds = embeds
-                st.success(f"인덱싱 완료 (청크 {len(chunks)}개)")
-with cols_idx[1]:
-    st.caption("※ 청크/오버랩/Top-K 파라미터는 내부 기본값으로 자동 처리합니다.")
+            rag["chunks"]+=texts
+            rag["embeds"]=np.vstack([rag["embeds"], vec])
+        st.success(f"문서 인덱싱: 청크 {len(texts)}개 추가. 총 {len(rag['chunks'])}개")
 
-st.divider()
+# ================== 공통: 질문 생성기 / 채점기 ==================
+def build_company_ctx() -> str:
+    return textwrap.dedent(f"""
+    [모집 분야] {c.get('role_title') or ''}
+    [주요 업무] {", ".join(c.get('responsibilities', [])[:6])}
+    [자격 요건] {", ".join(c.get('qualifications', [])[:6])}
+    [우대 사항] {", ".join(c.get('preference', [])[:6])}
+    """).strip()
 
-# ================== 4) 이력서 기반 자소서 생성 ==================
-st.header("4) 이력서 기반 자소서 생성")
-topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
+def retrieve_supports(query:str, k:int=4)->List[Tuple[float,str]]:
+    if rag["embeds"] is None or not rag["chunks"]:
+        return []
+    qv=embed([query])
+    scores, idxs = cosine_topk(rag["embeds"], qv, k=k)
+    return [(float(s), rag["chunks"][int(i)]) for s,i in zip(scores, idxs)]
 
-def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, model: str) -> str:
-    company = json.dumps(clean_struct or {}, ensure_ascii=False)
-    resume_snippet = resume_text.strip()
-    if len(resume_snippet) > 9000:
-        resume_snippet = resume_snippet[:9000]
-    system = (
-        "너는 한국어 자기소개서 전문가다. 채용 공고의 회사/직무 요건과 후보자의 이력서를 참고해 "
-        "회사 특화 자소서를 작성한다. 과장/허위는 금지하고, 수치/지표/기간/임팩트 중심으로 구체화한다."
-    )
-    if topic_hint and topic_hint.strip():
-        req = f"회사 측 요청 주제는 '{topic_hint.strip()}' 이다. 이 주제를 중심으로 서술하라."
+def gen_questions(model:str, ctx:str, n:int=5)->List[str]:
+    sys = ("너는 한국 IT기업 면접관이다. 컨텍스트를 반영해 **행동(STAR), 기술 심층, 가치 적합성**이 섞이도록 "
+           f"{n}개의 서로 다른 질문을 만들어라. 각 문장은 1줄.")
+    user = f"[컨텍스트]\n{ctx}"
+    r=client.chat.completions.create(model=model, temperature=0.9,
+                                     messages=[{"role":"system","content":sys},
+                                               {"role":"user","content":user}])
+    raw=r.choices[0].message.content.strip()
+    qs=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in raw.splitlines() if len(x.strip())>3]
+    return qs[:n]
+
+COMP_KEYS=["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
+
+def score_answer(model:str, question:str, answer:str, ctx:str, supports:List[Tuple[float,str]]):
+    sup_txt="\n".join([f"- ({s:.2f}) {t[:400]}" for s,t in supports]) if supports else ""
+    sys=( "너는 혹독하지만 공정한 면접 코치다. 다음 형식으로만 한국어로 답해라.\n"
+         "1) 총점: 0~100 정수 1개\n"
+         "2) 기준별 근거(점수/감점/개선): 각 항목에 대해 한 줄로 엄격하게\n"
+         "3) 수정본 답변(STAR)\n"
+         f"4) 역량 점수(0~20, 쉼표 5개): {', '.join(COMP_KEYS)}")
+    user=(f"[질문]\n{question}\n\n[후보자 답변]\n{answer}\n\n[회사/공고 컨텍스트]\n{ctx}\n"
+          f"[지원 문서 발췌]\n{sup_txt}")
+    r=client.chat.completions.create(model=model, temperature=0.3,
+                                     messages=[{"role":"system","content":sys},
+                                               {"role":"user","content":user}])
+    text=r.choices[0].message.content.strip()
+
+    # 총점
+    score=None
+    m=re.search(r'(\d{1,3})\s*(?:/100|점|$)', text)
+    if m: score=max(0,min(100,int(m.group(1))))
+    # 역량
+    nums=re.findall(r'\b(\d{1,2})\b', text.splitlines()[-1])
+    comps=None
+    if len(nums)>=5:
+        cand=[int(x) for x in nums[:5]]
+        if all(0<=x<=5 for x in cand): cand=[x*4 for x in cand]
+        if all(0<=x<=10 for x in cand) and any(x>5 for x in cand): cand=[x*2 for x in cand]
+        comps=[max(0,min(20,x)) for x in cand]
+    return {"raw":text,"score":score,"competencies":comps}
+
+# ================== 4) 질문 생성 · 답변 · 피드백 (예전 구조 복구) ==================
+st.header("4) 질문 생성 · 답변 · 피드백")
+MODEL=DEFAULT_MODEL
+
+if "questions" not in st.session_state:
+    st.session_state.questions=[]
+
+colq1,colq2=st.columns([1,1])
+with colq1:
+    if st.button("질문 생성", type="primary"):
+        ctx=build_company_ctx()
+        st.session_state.questions=gen_questions(MODEL, ctx, n=5)
+with colq2:
+    if st.button("질문 비우기"):
+        st.session_state.questions=[]
+
+if st.session_state.questions:
+    st.markdown("**생성된 질문:**")
+    for i,q in enumerate(st.session_state.questions,1):
+        st.markdown(f"{i}. {q}")
+
+sel_q = st.selectbox("채점할 질문 선택", st.session_state.questions, index=0 if st.session_state.questions else None)
+user_ans = st.text_area("답변 입력", height=160, key="main_answer")
+
+if "history" not in st.session_state:
+    st.session_state.history=[]
+
+if st.button("채점 실행", type="primary"):
+    if not sel_q or not user_ans.strip():
+        st.warning("질문과 답변을 확인해 주세요.")
     else:
-        req = "특정 주제 요청이 없으므로, 채용 공고의 요건을 중심으로 지원동기와 직무적합성을 강조하라."
-    user = (
-        f"[회사/직무 요약(JSON)]\n{company}\n\n"
-        f"[후보자 이력서(요약 가능)]\n{resume_snippet}\n\n"
-        f"[작성 지시]\n- {req}\n"
-        "- 분량: 600~900자\n"
-        "- 구성: 1) 지원 동기 2) 직무 관련 핵심 역량·경험 3) 성과/지표 4) 입사 후 기여 방안 5) 마무리\n"
-        "- 자연스럽고 진정성 있는 1인칭 서술. 문장과 문단 가독성을 유지.\n"
-        "- 불필요한 미사여구/중복/광고 문구 삭제."
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=model, temperature=0.4,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}]
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"(자소서 생성 실패: {e})"
-
-if st.button("자소서 생성", type="primary"):
-    if not st.session_state.clean_struct:
-        st.warning("먼저 회사 URL을 정제하세요.")
-    elif not st.session_state.resume_raw.strip():
-        st.warning("먼저 이력서를 업로드하고 '이력서 인덱싱(자동)'을 눌러주세요.")
-    else:
-        with st.spinner("자소서 생성 중..."):
-            cover = build_cover_letter(st.session_state.clean_struct, st.session_state.resume_raw, topic, CHAT_MODEL)
-        st.subheader("자소서 (생성 결과)")
-        st.write(cover)
-        st.download_button("자소서 TXT 다운로드", data=cover.encode("utf-8"),
-                           file_name="cover_letter.txt", mime="text/plain")
-
-st.divider()
-
-# ================== 5) 질문 생성 & 답변 초안 (시드/개수 UI 제거, 1문항 바로 생성) ==================
-st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
-level  = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
-
-cols_q = st.columns(2)
-with cols_q[0]:
-    if st.button("새 질문 받기", type="primary"):
-        if not st.session_state.clean_struct:
-            st.warning("먼저 회사 URL을 정제하세요.")
-        else:
-            q = llm_generate_one_question_with_resume(st.session_state.clean_struct, level, CHAT_MODEL)
-            if q:
-                st.session_state.current_question = q
-                st.session_state.answer_text = ""  # 이전 답변 초기화
-                st.session_state.last_result = None
-                st.session_state.followups = []
-                st.session_state.selected_followup = ""
-                st.session_state.followup_answer = ""
-                st.success("질문 생성 완료!")
-            else:
-                st.error("질문 생성 실패")
-with cols_q[1]:
-    if st.button("RAG로 답변 초안 생성", type="secondary"):
-        if not st.session_state.current_question:
-            st.warning("먼저 질문을 생성하세요.")
-        else:
-            draft = llm_draft_answer(st.session_state.clean_struct, st.session_state.current_question, CHAT_MODEL)
-            if draft:
-                st.session_state.answer_text = draft
-                st.success("초안 생성 완료!")
-            else:
-                st.error("초안 생성 실패")
-
-st.text_area("질문", value=st.session_state.current_question, height=100)
-ans = st.text_area("나의 답변 (초안을 편집해 완성하세요)", height=200, key="answer_text")
-
-# ================== 6) 채점 & 코칭 (엄격 모드) ==================
-st.header("6) 채점 & 코칭 (엄격 모드)")
-if st.button("채점 & 코칭 실행", type="primary"):
-    if not st.session_state.current_question:
-        st.warning("먼저 질문을 생성하세요.")
-    elif not st.session_state.answer_text.strip():
-        st.warning("답변을 작성해 주세요.")
-    else:
-        with st.spinner("채점/코칭 중..."):
-            res = llm_score_and_coach_strict(
-                st.session_state.clean_struct,
-                st.session_state.current_question,
-                st.session_state.answer_text,
-                CHAT_MODEL
-            )
-        st.session_state.last_result = res
-        st.session_state.records.append({
-            "question": st.session_state.current_question,
-            "answer": st.session_state.answer_text,
-            "overall": res.get("overall_score", 0),
-            "criteria": res.get("criteria", []),
-            "strengths": res.get("strengths", []),
-            "risks": res.get("risks", []),
-            "improvements": res.get("improvements", []),
-            "revised_answer": res.get("revised_answer","")
+        ctx=build_company_ctx()
+        supports=retrieve_supports(sel_q + "\n" + user_ans, k=4)
+        res=score_answer(MODEL, sel_q, user_ans, ctx, supports)
+        st.session_state.history.append({
+            "ts": pd.Timestamp.now(),
+            "question": sel_q,
+            "answer": user_ans,
+            "score": res["score"],
+            "competencies": res["competencies"],
+            "feedback": res["raw"],
+            "supports": supports,
         })
-        st.success("채점/코칭 완료!")
 
-# ================== 7) 피드백 결과 (아래에 팔로업 인라인 배치) ==================
-st.header("7) 피드백 결과")
-last = st.session_state.last_result
-if last:
-    left, right = st.columns([1,3])
-    with left:
-        st.metric("총점(/100)", last.get("overall_score", 0))
-    with right:
-        st.markdown("**기준별 점수 & 코멘트**")
-        for it in last.get("criteria", []):
-            st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
-        if last.get("strengths"):
-            st.markdown("**강점**")
-            for s in last["strengths"]: st.markdown(f"- {s}")
-        if last.get("risks"):
-            st.markdown("**감점 요인/리스크**")
-            for r in last["risks"]: st.markdown(f"- {r}")
-        if last.get("improvements"):
-            st.markdown("**개선 포인트**")
-            for im in last["improvements"]: st.markdown(f"- {im}")
-        if last.get("revised_answer"):
-            st.markdown("**수정본 답변 (STAR)**")
-            st.write(last["revised_answer"])
-else:
-    st.info("아직 채점 결과가 없습니다.")
+# ----- 결과 표시 -----
+st.subheader("피드백 결과")
+if st.session_state.history:
+    last=st.session_state.history[-1]
+    c1,c2=st.columns([1,3])
+    with c1:
+        st.metric("총점(/100)", last.get("score","—"))
+    with c2:
+        st.markdown(last.get("feedback",""))
 
-st.divider()
+# ================== 5) 팔로업 질문 · 답변 · 피드백 (동일 구조) ==================
+st.header("5) 팔로업 질문 · 답변 · 피드백")
 
-# ================== 8) (피드백 아래) 팔로업 질문 ▶ 답변 ▶ 팔로업 피드백 ==================
-st.subheader("팔로업 질문 · 답변 · 피드백")
-# 메인 피드백이 존재할 때만 팔로업 제안
-if last and not st.session_state.followups:
-    try:
-        ctx = json.dumps(st.session_state.clean_struct or {}, ensure_ascii=False)
-        msg = {
-            "role":"user",
-            "content":(
-                f"[회사/직무/요건]\n{ctx}\n\n"
-                f"[지원자 답변]\n{st.session_state.answer_text}\n\n"
-                "면접관 관점에서 팔로업 질문 3개를 한 줄씩 한국어로 제안해줘. "
-                "기존 질문과 중복되지 않게, 지표/리스크/트레이드오프/의사결정 근거를 섞어줘."
-            )
-        }
-        r = client.chat.completions.create(model=CHAT_MODEL, temperature=0.7,
-                                           messages=[{"role":"system","content":"면접 팔로업 생성기"}, msg])
-        followups = [re.sub(r'^\s*\d+[\).\s-]*','', l).strip()
-                     for l in r.choices[0].message.content.splitlines() if l.strip()]
-        st.session_state.followups = followups[:3]
-    except Exception:
-        st.session_state.followups = []
+# 팔로업 질문 제안 (자동)
+if "followup_pool" not in st.session_state:
+    st.session_state.followup_pool=[]
+if st.button("팔로업 질문 제안 갱신"):
+    # 최근 결과를 바탕으로 팔로업 3개 제안
+    base_q = (st.session_state.history[-1]["question"] if st.session_state.history else "") or ""
+    base_ans= (st.session_state.history[-1]["answer"] if st.session_state.history else "") or ""
+    ctx=build_company_ctx()
+    sys=("너는 까다로운 면접관이다. 아래 질문/답변을 바탕으로 **심층 팔로업 질문 3개**를 1줄씩 제안하라. 모호하면 안 된다.")
+    user=f"[원질문]\n{base_q}\n\n[기존답변]\n{base_ans}\n\n[회사/공고 컨텍스트]\n{ctx}"
+    r=client.chat.completions.create(model=MODEL, temperature=0.7,
+                                     messages=[{"role":"system","content":sys},
+                                               {"role":"user","content":user}])
+    lines=[re.sub(r'^\s*\d+[.)]\s*','',x).strip() for x in r.choices[0].message.content.strip().splitlines() if len(x.strip())>3]
+    st.session_state.followup_pool=lines[:3]
+if st.session_state.followup_pool:
+    st.markdown("**팔로업 질문 제안**")
+    for i,q in enumerate(st.session_state.followup_pool,1):
+        st.markdown(f"{i}) {q}")
 
-if last:
-    if st.session_state.followups:
-        st.markdown("**팔로업 질문 제안**")
-        for i, f in enumerate(st.session_state.followups, 1):
-            st.markdown(f"- ({i}) {f}")
-        st.session_state.selected_followup = st.selectbox(
-            "채점 받을 팔로업 질문 선택", st.session_state.followups, index=0
-        )
-        st.session_state.followup_answer = st.text_area(
-            "팔로업 질문에 대한 나의 답변", height=160, key="followup_answer"
-        )
+followup_q = st.selectbox("채점할 팔로업 질문 선택", st.session_state.followup_pool, index=0 if st.session_state.followup_pool else None, key="followup_select")
+followup_ans = st.text_area("팔로업 질문에 대한 나의 답변", height=140, key="followup_answer")
 
-        if st.button("팔로업 채점 & 피드백", type="secondary"):
-            fu_q = st.session_state.selected_followup
-            fu_ans = st.session_state.followup_answer
-            if not fu_q:
-                st.warning("팔로업 질문을 선택하세요.")
-            elif not fu_ans.strip():
-                st.warning("팔로업 답변을 작성하세요.")
-            else:
-                with st.spinner("팔로업 채점 중..."):
-                    res_fu = llm_score_and_coach_strict(
-                        st.session_state.clean_struct, fu_q, fu_ans, CHAT_MODEL
-                    )
-                st.session_state.last_followup_result = res_fu
-                st.markdown("**팔로업 결과**")
-                st.metric("총점(/100)", res_fu.get("overall_score", 0))
-                for it in res_fu.get("criteria", []):
-                    st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
-                if res_fu.get("revised_answer",""):
-                    st.markdown("**팔로업 수정본 (STAR)**")
-                    st.write(res_fu["revised_answer"])
+if "followup_history" not in st.session_state:
+    st.session_state.followup_history=[]
+
+if st.button("팔로업 채점 & 피드백", type="primary"):
+    if not followup_q or not followup_ans.strip():
+        st.warning("팔로업 질문과 답변을 입력해 주세요.")
     else:
-        st.caption("팔로업 질문은 메인 질문 채점 직후 자동 제안됩니다.")
+        ctx=build_company_ctx()
+        supports=retrieve_supports(followup_q + "\n" + followup_ans, k=4)
+        res=score_answer(MODEL, followup_q, followup_ans, ctx, supports)
+        st.session_state.followup_history.append({
+            "ts": pd.Timestamp.now(),
+            "question": followup_q,
+            "answer": followup_ans,
+            "score": res["score"],
+            "competencies": res["competencies"],
+            "feedback": res["raw"],
+            "supports": supports,
+        })
+
+# 팔로업 결과
+if st.session_state.followup_history:
+    st.subheader("팔로업 결과")
+    last=st.session_state.followup_history[-1]
+    c1,c2=st.columns([1,3])
+    with c1:
+        st.metric("총점(/100)", last.get("score","—"))
+    with c2:
+        st.markdown(last.get("feedback",""))
+
+# ================== 6) 역량 레이더 (세션 누적) ==================
+st.header("6) 역량 레이더 (세션 누적)")
+def to_df(hist):
+    rows=[h["competencies"] for h in hist if h.get("competencies") and len(h["competencies"])==5]
+    return pd.DataFrame(rows, columns=COMP_KEYS) if rows else None
+
+main_df = to_df(st.session_state.history) or pd.DataFrame(columns=COMP_KEYS)
+fup_df  = to_df(st.session_state.followup_history) or pd.DataFrame(columns=COMP_KEYS)
+
+avg = (pd.concat([main_df, fup_df]).mean() if not pd.concat([main_df, fup_df]).empty else pd.Series([0]*5, index=COMP_KEYS)).values.tolist()
+latest = (main_df.tail(1).values.tolist()[0] if len(main_df)>0 else [0]*5)
+
+if PLOTLY_OK:
+    fig=go.Figure()
+    fig.add_trace(go.Scatterpolar(r=latest+[latest[0]], theta=COMP_KEYS+[COMP_KEYS[0]], fill='toself', name="최신(본 질문)"))
+    fig.add_trace(go.Scatterpolar(r=avg+[avg[0]], theta=COMP_KEYS+[COMP_KEYS[0]], fill='toself', name="세션 평균"))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,20])), showlegend=True, height=420)
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.bar_chart(pd.DataFrame({"최신":latest,"평균":avg}, index=COMP_KEYS))
+
+# 표로도 확인
+tab1, tab2 = st.tabs(["본 질문 누적", "팔로업 누적"])
+with tab1:
+    if not main_df.empty:
+        main_df["합계"]=main_df.sum(axis=1)
+        st.dataframe(main_df, use_container_width=True)
+    else:
+        st.caption("본 질문 채점 결과가 아직 없습니다.")
+with tab2:
+    if not fup_df.empty:
+        fup_df["합계"]=fup_df.sum(axis=1)
+        st.dataframe(fup_df, use_container_width=True)
+    else:
+        st.caption("팔로업 채점 결과가 아직 없습니다.")
+
+st.caption("※ ‘우대 사항’은 사이트별 마크업 차이로 누락 가능—별도 처리 예정.")
