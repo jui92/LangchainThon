@@ -106,7 +106,7 @@ def fetch_bs4_text(url: str) -> Tuple[str, Optional[BeautifulSoup], Optional[str
     for b in blocks:
         if b not in seen:
             seen.add(b); out.append(b)
-    return ("\n\n".join(out)[:120000], soup, r.text
+    return ("\n\n".join(out)[:120000]), soup, r.text
 
 def fetch_all_text_static(url: str):
     url = normalize_url(url)
