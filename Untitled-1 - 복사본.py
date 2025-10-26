@@ -1,9 +1,4 @@
-###################################################################################################################
-#  1. 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다                  #
-#  2. 채용 포털 사이트 URL / 기업 홈페이지 URL / 뉴스 기사 를 참고하여 모의 면접을 실시하고 답변에 대한 피드백을 해줍니다.#
-###################################################################################################################
-
-# Library Import ( coding: utf-8 )
+# -*- coding: utf-8 -*-
 import os, re, json, urllib.parse, time, io, random
 from typing import Optional, Tuple, Dict, List
 
@@ -15,8 +10,8 @@ import pandas as pd
 import numpy as np
 
 # ================== 기본 설정 ==================
-st.set_page_config(page_title="Job Helper Bot", page_icon="🤖", layout="wide")
-st.title("Job Helper Bot : 자소서 생성 / 모의 면접")
+st.set_page_config(page_title="회사 맞춤 면접 코치 (Step2+팔로업 인라인)", page_icon="🎯", layout="wide")
+st.title("회사 맞춤 면접 코치 · URL 정제 → 자소서 → 질문/RAG/채점 → (피드백 아래) 팔로업")
 
 # ================== OpenAI ==================
 try:
@@ -49,8 +44,10 @@ def http_get(url: str, timeout: int = 12) -> Optional[requests.Response]:
     try:
         r = requests.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-                     "Accept-Language": "ko, en;q=0.9"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+                "Accept-Language": "ko, en;q=0.9",
+            },
             timeout=timeout,
         )
         if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
@@ -145,7 +142,7 @@ def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str,str]:
     meta["job_title"] = re.sub(r"\s+"," ", jt).strip()[:120]
     return meta
 
-# ================== 규칙 파서 ==================
+# ================== 규칙 파서 (우대 사항 보정) ==================
 def rule_based_sections(raw_text: str) -> dict:
     txt = re.sub(r"\r", "", raw_text or "").strip()
     lines = [re.sub(r"\s+", " ", l).strip(" -•·▶▪️") for l in txt.split("\n")]
@@ -176,8 +173,7 @@ def rule_based_sections(raw_text: str) -> dict:
                 continue
         push(l, bucket)
 
-    #kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
-    kw_pref = re.compile(r"(우대|\s*우대|\s*선호|갖추신\s*분|보유하신\s*분|있으신\s*분)", re.I)
+    kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
     remain_qual = []
     for q in out["qualifications"]:
         if kw_pref.search(q):
@@ -196,47 +192,57 @@ def rule_based_sections(raw_text: str) -> dict:
     return out
 
 # ================== LLM 정제 (채용 공고 → 구조 JSON) ==================
-PROMPT_SYSTEM_STRUCT = ("너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
-                        "입력 텍스트는 포털 광고 문구, UI잔재, 복수 직무가 섞여 있을 수 있다. "
-                        "한국어로 간결하고 중복없이 정제하라.")
+PROMPT_SYSTEM_STRUCT = (
+    "너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
+    "입력 텍스트는 포털 광고 문구, UI잔재, 복수 직무가 섞여 있을 수 있다. "
+    "한국어로 간결하고 중복없이 정제하라."
+)
 
 def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
     ctx = (raw_text or "").strip()
     if len(ctx) > 14000:
         ctx = ctx[:14000]
 
-    user_msg = {"role": "user",
-                "content": ("다음 채용 공고 원문을 구조화해줘.\n\n"
-                            f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
-                            f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
-                            "--- 원문 시작 ---\n"
-                            f"{ctx}\n"
-                            "--- 원문 끝 ---\n\n"
-                            "JSON으로만 답하고, 키는 반드시 아래만 포함:\n"
-                            "{"
-                            "\"company_name\": str, "
-                            "\"company_intro\": str, "
-                            "\"job_title\": str, "
-                            "\"responsibilities\": [str], "
-                            "\"qualifications\": [str], "           
-                            "\"preferences\": [str]"
-                            "}\n"
-                            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/갖추신 분분/보유하신 분/있으신 분' 등 표시가 있는 항목을 그대로 담아라.\n"
-                            "- 불릿/마커/이모지 제거, 문장 간결화, 중복 제거."),}
+    user_msg = {
+        "role": "user",
+        "content": (
+            "다음 채용 공고 원문을 구조화해줘.\n\n"
+            f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
+            f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
+            "--- 원문 시작 ---\n"
+            f"{ctx}\n"
+            "--- 원문 끝 ---\n\n"
+            "JSON으로만 답하고, 키는 반드시 아래만 포함:\n"
+            "{"
+            "\"company_name\": str, "
+            "\"company_intro\": str, "
+            "\"job_title\": str, "
+            "\"responsibilities\": [str], "
+            "\"qualifications\": [str], "
+            "\"preferences\": [str]"
+            "}\n"
+            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/Preferred/Nice to have/Plus' 등 표시가 있는 항목을 그대로 담아라.\n"
+            "- 불릿/마커/이모지 제거, 문장 간결화, 중복 제거."
+        ),
+    }
 
     try:
-        resp = client.chat.completions.create(model=model, temperature=0.2,
-                                              response_format={"type": "json_object"},
-                                              messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg])
+        resp = client.chat.completions.create(
+            model=model, temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg],
+        )
         data = json.loads(resp.choices[0].message.content)
     except Exception as e:
-        data = {"company_name": meta_hint.get("company_name",""),
-                "company_intro": meta_hint.get("company_intro","원문이 정제되지 않았습니다."),
-                "job_title": meta_hint.get("job_title",""),
-                "responsibilities": [],
-                "qualifications": [],
-                "preferences": [],
-                "error": str(e)}
+        data = {
+            "company_name": meta_hint.get("company_name",""),
+            "company_intro": meta_hint.get("company_intro","원문이 정제되지 않았습니다."),
+            "job_title": meta_hint.get("job_title",""),
+            "responsibilities": [],
+            "qualifications": [],
+            "preferences": [],
+            "error": str(e),
+        }
 
     for k in ["responsibilities","qualifications","preferences"]:
         arr = data.get(k, [])
@@ -263,8 +269,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
                     seen.add(s); pref.append(s)
             data["preferences"] = pref[:12]
         if not data["preferences"]:
-            kw_pref = re.compile(r"(우대|\s*우대|\s*선호|갖추신\s*분|보유하신\s*분|있으신\s*분)", re.I)
-            #kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
+            kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
             remain=[]; moved=[]
             for q in data.get("qualifications", []):
                 if kw_pref.search(q): moved.append(q)
@@ -350,8 +355,10 @@ def retrieve_resume_chunks(query: str, k: int = 4):
     scores, idxs = cosine_topk(embs, qv, k=k)
     return [(float(s), chs[int(i)]) for s, i in zip(scores, idxs)]
 
-# ================== 회사 비전/인재상/뉴스 ==================
-VISION_KEYS = ["비전","미션","핵심가치","가치","원칙","문화","행동강령","Talent","인재상","Our Mission","Vision","Values"]
+# ================== ★ NEW: 회사 비전/인재상/뉴스 ==================
+VISION_KEYS = [
+    "비전", "미션", "핵심가치", "가치", "원칙", "문화", "행동강령", "Talent", "인재상", "Our Mission", "Vision", "Values"
+]
 
 def safe_get_text(el) -> str:
     try:
@@ -365,7 +372,7 @@ def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
     if not home_url: return out
     base = normalize_url(home_url)
     if not base: return out
-    paths = ["","/","/about","/company","/about-us","/mission","/vision","/values","/culture","/careers","/talent","/people"]
+    paths = ["", "/", "/about", "/company", "/about-us", "/mission", "/vision", "/values", "/culture", "/careers", "/talent", "/people"]
     seen = set()
     for p in paths:
         url = (base.rstrip("/") + p) if p else base
@@ -397,7 +404,7 @@ def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
         out[k]=uniq[:12]
     return out
 
-# NAVER NEWS → Google News RSS 폴백
+# NAVER NEWS (선택) → Google News RSS 폴백
 def _load_naver_keys():
     cid = os.getenv("NAVER_CLIENT_ID")
     csec = os.getenv("NAVER_CLIENT_SECRET")
@@ -435,9 +442,11 @@ def google_news_rss(company: str, max_items: int = 5) -> List[Dict]:
         soup = BeautifulSoup(r.text, "xml")
         out=[]
         for it in soup.find_all("item")[:max_items]:
-            out.append({"title": (it.title.get_text() if it.title else "").strip(),
-                        "link": (it.link.get_text() if it.link else "").strip(),
-                        "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()})
+            out.append({
+                "title": (it.title.get_text() if it.title else "").strip(),
+                "link": (it.link.get_text() if it.link else "").strip(),
+                "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()
+            })
         return out
     except Exception:
         return []
@@ -448,16 +457,22 @@ def fetch_latest_news(company: str, max_items: int = 5) -> List[Dict]:
     return google_news_rss(company, max_items=max_items)
 
 # ================== 질문/초안/채점/팔로업 프롬프트 ==================
-PROMPT_SYSTEM_Q = ("너는 채용담당자다. 회사/직무 맥락과 채용요건, 그리고 지원자의 이력서 요약을 함께 고려해 "
-                   "면접 질문을 한국어로 생성한다. 질문은 서로 형태·관점·키워드가 겹치지 않게 다양화하고, "
-                   "수치/지표/기간/규모/리스크/트레이드오프 등도 섞어라.")
-PROMPT_SYSTEM_DRAFT = ("너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서 요약을 결합해 "
-                       "질문에 대한 답변 **초안**을 STAR(상황-과제-행동-성과)로 8~12문장, 한국어로 작성한다. "
-                       "가능하면 구체적인 지표/수치/기간/임팩트를 포함하라.")
-PROMPT_SYSTEM_SCORE_STRICT = ("너는 매우 엄격한 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
-                              "각 기준은 0~20 정수이며, 총점은 기준 합계(최대 100)와 반드시 일치해야 한다. "
-                              "과장/모호함/근거 부재/숫자 없는 주장/책임 회피/모호한 주어 사용 등을 강하게 감점하라. "
-                              "각 기준에 대해 짧지만 구체적 코멘트(강점/감점요인/개선포인트)를 제공하라.")
+PROMPT_SYSTEM_Q = (
+    "너는 채용담당자다. 회사/직무 맥락과 채용요건, 그리고 지원자의 이력서 요약을 함께 고려해 "
+    "면접 질문을 한국어로 생성한다. 질문은 서로 형태·관점·키워드가 겹치지 않게 다양화하고, "
+    "수치/지표/기간/규모/리스크/트레이드오프 등도 섞어라."
+)
+PROMPT_SYSTEM_DRAFT = (
+    "너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서 요약을 결합해 "
+    "질문에 대한 답변 **초안**을 STAR(상황-과제-행동-성과)로 8~12문장, 한국어로 작성한다. "
+    "가능하면 구체적인 지표/수치/기간/임팩트를 포함하라."
+)
+PROMPT_SYSTEM_SCORE_STRICT = (
+    "너는 매우 엄격한 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
+    "각 기준은 0~20 정수이며, 총점은 기준 합계(최대 100)와 반드시 일치해야 한다. "
+    "과장/모호함/근거 부재/숫자 없는 주장/책임 회피/모호한 주어 사용 등을 강하게 감점하라. "
+    "각 기준에 대해 짧지만 구체적 코멘트(강점/감점요인/개선포인트)를 제공하라."
+)
 CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
 
 def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str) -> str:
@@ -466,15 +481,21 @@ def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str) -
     resume_context = "\n".join([f"- {s[:350]}" for s in resume_snips])[:1200]
 
     ctx = json.dumps(clean, ensure_ascii=False)
-    user_msg = {"role": "user",
-                "content": (f"[회사/직무/요건]\n{ctx}\n\n"
-                            f"[지원자 이력서 요약(발췌)]\n{resume_context}\n\n"
-                            f"[요청]\n- 난이도/연차: {level}\n"
-                            f"- 중복/유사도 지양, 회사 요건과 이력서의 교집합 또는 공백영역을 겨냥\n"
-                            f"- 한국어 면접 질문 1개만 한 줄로 출력"),}
+    user_msg = {
+        "role": "user",
+        "content": (
+            f"[회사/직무/요건]\n{ctx}\n\n"
+            f"[지원자 이력서 요약(발췌)]\n{resume_context}\n\n"
+            f"[요청]\n- 난이도/연차: {level}\n"
+            f"- 중복/유사도 지양, 회사 요건과 이력서의 교집합 또는 공백영역을 겨냥\n"
+            f"- 한국어 면접 질문 1개만 한 줄로 출력"
+        ),
+    }
     try:
-        resp = client.chat.completions.create(model=model, temperature=0.85,
-                                              messages=[{"role":"system","content":PROMPT_SYSTEM_Q}, user_msg],)
+        resp = client.chat.completions.create(
+            model=model, temperature=0.85,
+            messages=[{"role":"system","content":PROMPT_SYSTEM_Q}, user_msg],
+        )
         q = resp.choices[0].message.content.strip()
         q = re.sub(r"^\s*\d+[\).\s-]*","", q).strip()
         q = q.split("\n")[0].strip()
@@ -486,14 +507,20 @@ def llm_draft_answer(clean: Dict, question: str, model: str) -> str:
     hits = retrieve_resume_chunks(question, k=4)
     resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
     ctx = json.dumps(clean, ensure_ascii=False)
-    user_msg = {"role": "user",
-                "content": (f"[회사/직무/채용요건]\n{ctx}\n\n"
-                            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
-                            f"[면접 질문]\n{question}\n\n"
-                            "위 정보를 근거로 STAR 기반 한국어 답변 **초안**을 작성해줘.")}
+    user_msg = {
+        "role": "user",
+        "content": (
+            f"[회사/직무/채용요건]\n{ctx}\n\n"
+            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
+            f"[면접 질문]\n{question}\n\n"
+            "위 정보를 근거로 STAR 기반 한국어 답변 **초안**을 작성해줘."
+        )
+    }
     try:
-        resp = client.chat.completions.create(model=model, temperature=0.5,
-                                              messages=[{"role":"system","content":PROMPT_SYSTEM_DRAFT}, user_msg],)
+        resp = client.chat.completions.create(
+            model=model, temperature=0.5,
+            messages=[{"role":"system","content":PROMPT_SYSTEM_DRAFT}, user_msg],
+        )
         return resp.choices[0].message.content.strip()
     except Exception:
         return ""
@@ -502,27 +529,34 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
     hits = retrieve_resume_chunks(question + "\n" + answer[:800], k=4)
     resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
     ctx = json.dumps(clean, ensure_ascii=False)
-    user_msg = {"role":"user",
-                "content": (f"[회사/직무/채용요건]\n{ctx}\n\n"
-                            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
-                            f"[면접 질문]\n{question}\n\n"
-                            f"[지원자 답변]\n{answer}\n\n"
-                            "다음 JSON 스키마로만 한국어 응답:\n"
-                            "{"
-                            "\"overall_score\": 0~100 정수,"
-                            "\"criteria\": [{\"name\":\"문제정의\",\"score\":0~20,\"comment\":\"...\"},"
-                            "{\"name\":\"데이터/지표\",\"score\":0~20,\"comment\":\"...\"},"
-                            "{\"name\":\"실행력/주도성\",\"score\":0~20,\"comment\":\"...\"},"
-                            "{\"name\":\"협업/커뮤니케이션\",\"score\":0~20,\"comment\":\"...\"},"
-                            "{\"name\":\"고객가치\",\"score\":0~20,\"comment\":\"...\"}],"
-                            "\"strengths\": [\"...\", \"...\"],"
-                            "\"risks\": [\"...\", \"...\"],"
-                            "\"improvements\": [\"...\", \"...\", \"...\"],"
-                            "\"revised_answer\": \"STAR 구조로 간결히\""
-                            "}")}
+    user_msg = {
+        "role":"user",
+        "content": (
+            f"[회사/직무/채용요건]\n{ctx}\n\n"
+            f"[지원자 이력서 발췌]\n{resume_text}\n\n"
+            f"[면접 질문]\n{question}\n\n"
+            f"[지원자 답변]\n{answer}\n\n"
+            "다음 JSON 스키마로만 한국어 응답:\n"
+            "{"
+            "\"overall_score\": 0~100 정수,"
+            "\"criteria\": [{\"name\":\"문제정의\",\"score\":0~20,\"comment\":\"...\"},"
+            "{\"name\":\"데이터/지표\",\"score\":0~20,\"comment\":\"...\"},"
+            "{\"name\":\"실행력/주도성\",\"score\":0~20,\"comment\":\"...\"},"
+            "{\"name\":\"협업/커뮤니케이션\",\"score\":0~20,\"comment\":\"...\"},"
+            "{\"name\":\"고객가치\",\"score\":0~20,\"comment\":\"...\"}],"
+            "\"strengths\": [\"...\", \"...\"],"
+            "\"risks\": [\"...\", \"...\"],"
+            "\"improvements\": [\"...\", \"...\", \"...\"],"
+            "\"revised_answer\": \"STAR 구조로 간결히\""
+            "}"
+        )
+    }
     try:
-        resp = client.chat.completions.create(model=model, temperature=0.2, response_format={"type":"json_object"}, 
-                                              messages=[{"role":"system","content":PROMPT_SYSTEM_SCORE_STRICT}, user_msg])
+        resp = client.chat.completions.create(
+            model=model, temperature=0.2,
+            response_format={"type":"json_object"},
+            messages=[{"role":"system","content":PROMPT_SYSTEM_SCORE_STRICT}, user_msg]
+        )
         data = json.loads(resp.choices[0].message.content)
         crit = data.get("criteria", [])
         fixed=[]
@@ -545,38 +579,43 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
         data["revised_answer"]=str(data.get("revised_answer","")).strip()
         return data
     except Exception as e:
-        return {"overall_score": 0,
-                "criteria": [{"name": n, "score": 0, "comment": ""} for n in CRITERIA],
-                "strengths": [], "risks": [], "improvements": [], "revised_answer": "",
-                "error": str(e),}
+        return {
+            "overall_score": 0,
+            "criteria": [{"name": n, "score": 0, "comment": ""} for n in CRITERIA],
+            "strengths": [], "risks": [], "improvements": [], "revised_answer": "",
+            "error": str(e),
+        }
 
 # ================== 세션 상태 ==================
 def _init_state():
-    for k, v in {"clean_struct": None,
-                 "resume_raw": "",
-                 "resume_chunks": [],
-                 "resume_embeds": None,
-                 "current_question": "",
-                 "answer_text": "",
-                 "records": [],
-                 "followups": [],
-                 "selected_followup": "",
-                 "followup_answer": "",
-                 "last_result": None,
-                 "last_followup_result": None,
-                 "company_home": "",
-                 "company_vision": [],
-                 "company_talent": [],
-                 "company_news": [] }.items():
+    for k, v in {
+        "clean_struct": None,
+        "resume_raw": "",
+        "resume_chunks": [],
+        "resume_embeds": None,
+        "current_question": "",
+        "answer_text": "",
+        "records": [],
+        "followups": [],
+        "selected_followup": "",
+        "followup_answer": "",
+        "last_result": None,
+        "last_followup_result": None,
+        # ★ VISION/NEWS
+        "company_home": "",
+        "company_vision": [],
+        "company_talent": [],
+        "company_news": []
+    }.items():
         if k not in st.session_state: st.session_state[k] = v
 _init_state()
 
 # ================== 1) 채용 공고 URL → 정제 ==================
-st.header("1) 채용 공고 URL")
-url = st.text_input("채용 공고 상세 URL", placeholder="취업 포털 사이트의 URL을 입력하세요.")
+st.header("1) 채용 공고 URL → 정제")
+url = st.text_input("채용 공고 상세 URL", placeholder="예: https://www.wanted.co.kr/wd/123456")
 
-# NEW: 회사 공식 홈페이지 URL (선택 입력 → 비전/인재상 수집에 사용)
-st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력하세요.")
+# ★ NEW: 회사 공식 홈페이지 URL (선택 입력 → 비전/인재상 수집에 사용)
+st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="https://example.com")
 
 if st.button("원문 수집 → 정제", type="primary"):
     if not url.strip():
@@ -596,7 +635,7 @@ if st.button("원문 수집 → 정제", type="primary"):
                     clean["preferences"] = rb["preferences"][:12]
             st.session_state.clean_struct = clean
 
-            # VISION/NEWS: 회사 비전/인재상/뉴스 수집
+            # ★ VISION/NEWS: 회사 비전/인재상/뉴스 수집
             with st.spinner("회사 비전/인재상/뉴스 확인 중..."):
                 # 1) 홈페이지에서 비전/인재상 긁기 (선택입력 시)
                 vis = []; tal = []
@@ -615,7 +654,7 @@ if st.button("원문 수집 → 정제", type="primary"):
             st.success("정제 완료!")
 
 # ================== 2) 회사 요약 (정제 결과) ==================
-st.header("2) 회사 요약")
+st.header("2) 회사 요약 (정제 결과)")
 clean = st.session_state.clean_struct
 if clean:
     st.markdown(f"**회사명:** {clean.get('company_name','-')}")
@@ -638,10 +677,10 @@ if clean:
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
-# VISION/NEWS: 회사 비전/인재상/뉴스 (있을 때만 표시)
+# ★ VISION/NEWS: 회사 비전/인재상/뉴스 (있을 때만 표시)
 if st.session_state.company_vision or st.session_state.company_talent or st.session_state.company_news:
     st.divider()
-    st.subheader("회사 비전/인재상 & 최신 이슈")  
+    st.subheader("회사 비전/인재상 & 최신 이슈")  # 비전·인재상·뉴스
     colv, colt = st.columns(2)
     with colv:
         st.markdown("**비전/핵심가치 (스크래핑)**")
@@ -665,13 +704,15 @@ st.divider()
 
 # ================== 3) 내 이력서/프로젝트 업로드 (PDF/TXT/MD/DOCX) ==================
 st.header("3) 내 이력서/프로젝트 업로드")
-uploads = st.file_uploader("여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True)
-_RESUME_CHUNK = 500
-_RESUME_OVLP  = 100
+uploads = st.file_uploader(
+    "여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True
+)
+_RESUME_CHUNK = 600
+_RESUME_OVLP  = 120
 
 cols_idx = st.columns(2)
 with cols_idx[0]:
-    if st.button("이력서 인덱싱", type="secondary"):
+    if st.button("이력서 인덱싱(자동)", type="secondary"):
         if not uploads:
             st.warning("파일을 업로드하세요.")
         else:
@@ -690,6 +731,8 @@ with cols_idx[0]:
                 st.session_state.resume_chunks = chunks
                 st.session_state.resume_embeds = embeds
                 st.success(f"인덱싱 완료 (청크 {len(chunks)}개)")
+with cols_idx[1]:
+    st.caption("※ 청크/오버랩/Top-K 파라미터는 내부 기본값으로 자동 처리합니다.")
 
 st.divider()
 
@@ -699,30 +742,38 @@ topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 직무 �
 
 def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, model: str) -> str:
     # 회사 비전/인재상/뉴스도 자연스럽게 반영하도록 컨텍스트에 추가
-    enrich = {"vision": st.session_state.company_vision[:6],
-              "talent": st.session_state.company_talent[:6],
-              "news": [n.get("title","") for n in st.session_state.company_news[:3]]}
+    enrich = {
+        "vision": st.session_state.company_vision[:6],
+        "talent": st.session_state.company_talent[:6],
+        "news": [n.get("title","") for n in st.session_state.company_news[:3]]
+    }
     company = json.dumps({"clean":clean_struct, "extra":enrich}, ensure_ascii=False)
     resume_snippet = resume_text.strip()
     if len(resume_snippet) > 9000:
         resume_snippet = resume_snippet[:9000]
-    system = ("너는 한국어 자기소개서 전문가다. 채용 공고의 회사/직무 요건과 후보자의 이력서를 참고해 "
-              "회사 특화 자소서를 작성한다. 과장/허위는 금지하고, 수치/지표/기간/임팩트 중심으로 구체화한다. "
-              "회사의 비전/인재상/최근 이슈가 제공되면 자연스럽게 연결하라.")
+    system = (
+        "너는 한국어 자기소개서 전문가다. 채용 공고의 회사/직무 요건과 후보자의 이력서를 참고해 "
+        "회사 특화 자소서를 작성한다. 과장/허위는 금지하고, 수치/지표/기간/임팩트 중심으로 구체화한다. "
+        "회사의 비전/인재상/최근 이슈가 제공되면 자연스럽게 연결하라."
+    )
     if topic_hint and topic_hint.strip():
         req = f"회사 측 요청 주제는 '{topic_hint.strip()}' 이다. 이 주제를 중심으로 서술하라."
     else:
         req = "특정 주제 요청이 없으므로, 채용 공고와 비전/인재상을 중심으로 지원동기와 직무적합성을 강조하라."
-    user = (f"[회사/직무 요약(JSON)]\n{company}\n\n"
-            f"[후보자 이력서(요약 가능)]\n{resume_snippet}\n\n"
-            f"[작성 지시]\n- {req}\n"
-            "- 분량: 600~900자\n"
-            "- 구성: 1) 지원 동기 2) 직무 관련 핵심 역량·경험 3) 성과/지표 4) 입사 후 기여 방안 5) 마무리\n"
-            "- 자연스럽고 진정성 있는 1인칭 서술. 문장과 문단 가독성을 유지.\n"
-            "- 불필요한 미사여구/중복/광고 문구 삭제.")
+    user = (
+        f"[회사/직무 요약(JSON)]\n{company}\n\n"
+        f"[후보자 이력서(요약 가능)]\n{resume_snippet}\n\n"
+        f"[작성 지시]\n- {req}\n"
+        "- 분량: 600~900자\n"
+        "- 구성: 1) 지원 동기 2) 직무 관련 핵심 역량·경험 3) 성과/지표 4) 입사 후 기여 방안 5) 마무리\n"
+        "- 자연스럽고 진정성 있는 1인칭 서술. 문장과 문단 가독성을 유지.\n"
+        "- 불필요한 미사여구/중복/광고 문구 삭제."
+    )
     try:
-        resp = client.chat.completions.create(model=model, temperature=0.4,
-                                              messages=[{"role":"system","content":system},{"role":"user","content":user}])
+        resp = client.chat.completions.create(
+            model=model, temperature=0.4,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}]
+        )
         return resp.choices[0].message.content.strip()
     except Exception as e:
         return f"(자소서 생성 실패: {e})"
@@ -737,7 +788,8 @@ if st.button("자소서 생성", type="primary"):
             cover = build_cover_letter(st.session_state.clean_struct, st.session_state.resume_raw, topic, CHAT_MODEL)
         st.subheader("자소서 (생성 결과)")
         st.write(cover)
-        st.download_button("자소서 TXT 다운로드", data=cover.encode("utf-8"),file_name="cover_letter.txt", mime="text/plain")
+        st.download_button("자소서 TXT 다운로드", data=cover.encode("utf-8"),
+                           file_name="cover_letter.txt", mime="text/plain")
 
 st.divider()
 
@@ -754,7 +806,7 @@ with cols_q[0]:
             q = llm_generate_one_question_with_resume(st.session_state.clean_struct, level, CHAT_MODEL)
             if q:
                 st.session_state.current_question = q
-                st.session_state.answer_text = ""       # 이전 답변 초기화
+                st.session_state.answer_text = ""  # 이전 답변 초기화
                 st.session_state.last_result = None
                 st.session_state.followups = []
                 st.session_state.selected_followup = ""
@@ -778,7 +830,7 @@ st.text_area("질문", value=st.session_state.current_question, height=100)
 ans = st.text_area("나의 답변 (초안을 편집해 완성하세요)", height=200, key="answer_text")
 
 # ================== 6) 채점 & 코칭 (엄격 모드) ==================
-st.header("6) 채점 & 코칭")
+st.header("6) 채점 & 코칭 (엄격 모드)")
 if st.button("채점 & 코칭 실행", type="primary"):
     if not st.session_state.current_question:
         st.warning("먼저 질문을 생성하세요.")
@@ -786,19 +838,23 @@ if st.button("채점 & 코칭 실행", type="primary"):
         st.warning("답변을 작성해 주세요.")
     else:
         with st.spinner("채점/코칭 중..."):
-            res = llm_score_and_coach_strict(st.session_state.clean_struct,
-                                             st.session_state.current_question,
-                                             st.session_state.answer_text,
-                                             CHAT_MODEL)
+            res = llm_score_and_coach_strict(
+                st.session_state.clean_struct,
+                st.session_state.current_question,
+                st.session_state.answer_text,
+                CHAT_MODEL
+            )
         st.session_state.last_result = res
-        st.session_state.records.append({"question": st.session_state.current_question,
-                                         "answer": st.session_state.answer_text, 
-                                         "overall": res.get("overall_score", 0),
-                                         "criteria": res.get("criteria", []),
-                                         "strengths": res.get("strengths", []),
-                                         "risks": res.get("risks", []),
-                                         "improvements": res.get("improvements", []),
-                                         "revised_answer": res.get("revised_answer","")})
+        st.session_state.records.append({
+            "question": st.session_state.current_question,
+            "answer": st.session_state.answer_text,
+            "overall": res.get("overall_score", 0),
+            "criteria": res.get("criteria", []),
+            "strengths": res.get("strengths", []),
+            "risks": res.get("risks", []),
+            "improvements": res.get("improvements", []),
+            "revised_answer": res.get("revised_answer","")
+        })
         st.success("채점/코칭 완료!")
 
 # ================== 7) 피드백 결과 (아래에 팔로업 인라인 배치) ==================
@@ -829,20 +885,26 @@ else:
 
 st.divider()
 
-# ================== 8) 팔로업 질문 → 답변 → 팔로업 피드백 ==================
+# ================== 8) (피드백 아래) 팔로업 질문 ▶ 답변 ▶ 팔로업 피드백 ==================
 st.subheader("팔로업 질문 · 답변 · 피드백")
 # 메인 피드백이 존재할 때만 팔로업 제안
 if last and not st.session_state.followups:
     try:
-        ctx = json.dumps({"company": st.session_state.clean_struct,
-                          "vision": st.session_state.company_vision[:6],
-                          "talent": st.session_state.company_talent[:6],
-                          "news": [n.get("title","") for n in st.session_state.company_news[:3]]}, ensure_ascii=False)
-        msg = {"role":"user",
-               "content":(f"[회사/직무/요건/비전/이슈]\n{ctx}\n\n"
-                          f"[지원자 답변]\n{st.session_state.answer_text}\n\n"
-                          "면접관 관점에서 팔로업 질문 3개를 한 줄씩 한국어로 제안해줘. "
-                          "기존 질문과 중복되지 않게, 지표/리스크/트레이드오프/의사결정 근거를 섞어줘.")}
+        ctx = json.dumps({
+            "company": st.session_state.clean_struct,
+            "vision": st.session_state.company_vision[:6],
+            "talent": st.session_state.company_talent[:6],
+            "news": [n.get("title","") for n in st.session_state.company_news[:3]]
+        }, ensure_ascii=False)
+        msg = {
+            "role":"user",
+            "content":(
+                f"[회사/직무/요건/비전/이슈]\n{ctx}\n\n"
+                f"[지원자 답변]\n{st.session_state.answer_text}\n\n"
+                "면접관 관점에서 팔로업 질문 3개를 한 줄씩 한국어로 제안해줘. "
+                "기존 질문과 중복되지 않게, 지표/리스크/트레이드오프/의사결정 근거를 섞어줘."
+            )
+        }
         r = client.chat.completions.create(model=CHAT_MODEL, temperature=0.7,
                                            messages=[{"role":"system","content":"면접 팔로업 생성기"}, msg])
         followups = [re.sub(r'^\s*\d+[\).\s-]*','', l).strip()
@@ -870,7 +932,9 @@ if last:
                 st.warning("팔로업 답변을 작성하세요.")
             else:
                 with st.spinner("팔로업 채점 중..."):
-                    res_fu = llm_score_and_coach_strict(st.session_state.clean_struct, fu_q, fu_ans, CHAT_MODEL)
+                    res_fu = llm_score_and_coach_strict(
+                        st.session_state.clean_struct, fu_q, fu_ans, CHAT_MODEL
+                    )
                 st.session_state.last_followup_result = res_fu
                 st.markdown("**팔로업 결과**")
                 st.metric("총점(/100)", res_fu.get("overall_score", 0))
