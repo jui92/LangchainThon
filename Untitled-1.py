@@ -47,12 +47,9 @@ def normalize_url(u: str) -> Optional[str]:
 
 def http_get(url: str, timeout: int = 12) -> Optional[requests.Response]:
     try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-                     "Accept-Language": "ko, en;q=0.9"},
-            timeout=timeout,
-        )
+        r = requests.get(url,
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+                                  "Accept-Language": "ko, en;q=0.9"}, timeout=timeout,)
         if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
             return r
     except Exception:
@@ -176,8 +173,7 @@ def rule_based_sections(raw_text: str) -> dict:
                 continue
         push(l, bucket)
 
-    #kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
-    kw_pref = re.compile(r"(우대|\s*우대|\s*선호|갖추신\s*분|보유하신\s*분|있으신\s*분)", re.I)
+    kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
     remain_qual = []
     for q in out["qualifications"]:
         if kw_pref.search(q):
@@ -219,9 +215,9 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
                             "\"job_title\": str, "
                             "\"responsibilities\": [str], "
                             "\"qualifications\": [str], "           
-                            "\"preferences\": [str]"
+                            "\"preferences\": [str]"               
                             "}\n"
-                            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/갖추신 분분/보유하신 분/있으신 분' 등 표시가 있는 항목을 그대로 담아라.\n"
+                            "- '우대 사항(preferences)'은 비워두지 말고, 원문에서 '우대/선호/preferred/plus/가산점' 등 표시가 있는 항목을 그대로 담아라.\n"
                             "- 불릿/마커/이모지 제거, 문장 간결화, 중복 제거."),}
 
     try:
@@ -263,8 +259,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
                     seen.add(s); pref.append(s)
             data["preferences"] = pref[:12]
         if not data["preferences"]:
-            kw_pref = re.compile(r"(우대|\s*우대|\s*선호|갖추신\s*분|보유하신\s*분|있으신\s*분)", re.I)
-            #kw_pref = re.compile(r"(우대|preferred|nice to have|plus|가산점|있으면\s*좋음)", re.I)
+            kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
             remain=[]; moved=[]
             for q in data.get("qualifications", []):
                 if kw_pref.search(q): moved.append(q)
