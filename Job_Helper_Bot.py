@@ -1,7 +1,7 @@
 ###################################################################################################################
-#  1. 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다.                  #
-#  2. 채용 포털 사이트 URL / 기업 홈페이지 URL / 뉴스 기사 를 참고하여 모의 면접을 실시하고 답변에 대한 피드백을 해줍니다. #
-####################################################################################################################
+#  1. 채용 포털 사이트 URL로 조회한 회사 정보와 등록한 이력서를 바탕으로 자소서를 자동으로 생성해줍니다                  #
+#  2. 채용 포털 사이트 URL / 기업 홈페이지 URL / 뉴스 기사 를 참고하여 모의 면접을 실시하고 답변에 대한 피드백을 해줍니다.#
+###################################################################################################################
 
 # Library Import ( coding: utf-8 )
 import os, re, json, urllib.parse, time, io, random
@@ -150,7 +150,7 @@ def rule_based_sections(raw_text: str) -> dict:
 
     hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
     hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
-    hdr_pref = re.compile(r"(우대\s*사항|우대|Preferred|Nice\s*to\s*have|Plus)", re.I)
+    hdr_pref = re.compile(r"(우대\s*사항|우대|선호|Preferred|Nice\s*to\s*have|Plus)", re.I)
 
     bucket = None
     out = {"responsibilities": [], "qualifications": [], "preferences": []}
@@ -163,7 +163,6 @@ def rule_based_sections(raw_text: str) -> dict:
         if hdr_resp.search(l): bucket = "responsibilities"; continue
         if hdr_qual.search(l): bucket = "qualifications"; continue
         if hdr_pref.search(l): bucket = "preferences"; continue
-
         if bucket is None:
             if hdr_pref.search(l):
                 bucket = "preferences"
@@ -172,7 +171,7 @@ def rule_based_sections(raw_text: str) -> dict:
             else:
                 continue
         push(l, bucket)
-
+    
     kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
     remain_qual = []
     for q in out["qualifications"]:
@@ -570,9 +569,8 @@ _init_state()
 st.header("1) 채용 공고 URL")
 url = st.text_input("채용 공고 상세 URL", placeholder="취업 포털 사이트의 URL을 입력하세요.")
 
-# NEW: 회사 공식 홈페이지 URL (선택 입력 → 비전/인재상 수집에 사용)
+# 회사 공식 홈페이지 URL (선택 입력 → 비전/인재상 수집에 사용)
 st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력하세요.")
-
 if st.button("원문 수집 → 정제", type="primary"):
     if not url.strip():
         st.warning("URL을 입력하세요.")
@@ -852,10 +850,8 @@ if last:
         for i, f in enumerate(st.session_state.followups, 1):
             st.markdown(f"- ({i}) {f}")
 
-        st.selectbox("채점 받을 팔로업 질문 선택",
-                     st.session_state.followups, index=0, key="selected_followup")
+        st.selectbox("채점 받을 팔로업 질문 선택", st.session_state.followups, index=0, key="selected_followup")
         st.text_area("팔로업 질문에 대한 나의 답변", height=160, key="followup_answer")
-
         if st.button("팔로업 채점 & 피드백", type="secondary"):
             fu_q   = st.session_state.get("selected_followup", "")
             fu_ans = st.session_state.get("followup_answer", "")
@@ -876,4 +872,3 @@ if last:
                     st.write(res_fu["revised_answer"])
     else:
         st.caption("팔로업 질문은 메인 질문 채점 직후 자동 제안됩니다.")
-
