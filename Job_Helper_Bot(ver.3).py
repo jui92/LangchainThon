@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY, Selenium Manager, no-lxml, Wanted-patch)
+# Job Helper Bot (Selenium-ONLY, Selenium Manager, no-lxml, Wanted fixed)
 # - 자소서/질문/채점
-# - 오직 Selenium으로 채용 공고 수집 (폴백 없음)
+# - Selenium만 사용 (폴백 없음)
 # - lxml 미사용 (BeautifulSoup: html.parser)
-# - 드라이버는 Selenium Manager가 자동 관리 (chromium만 설치되어 있으면 됨)
-# - Wanted(https://www.wanted.co.kr) 페이지: DOM + __NEXT_DATA__에서 텍스트 수집
+# - 원티드(Next.js) __NEXT_DATA__를 HTML에서 직접 파싱하여 텍스트 병합
 ################################################################################
 
 import os, re, json, urllib.parse, time, io, tempfile, shutil, traceback
@@ -210,48 +209,17 @@ def _expand_jobkorea(driver):
     _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"])
 
 # -----------------------------------------------------------------------------
-# Wanted: __NEXT_DATA__에서 텍스트 추출
+# Wanted: __NEXT_DATA__를 HTML에서 직접 파싱 → 텍스트로 반환
 # -----------------------------------------------------------------------------
-def _safe_text(x): return re.sub(r"\s+", " ", (x or "")).strip()
-
-def _walk_collect(d, out, key_whitelist):
-    if isinstance(d, dict):
-        for k, v in d.items():
-            kl = str(k).lower()
-            if any(t in kl for t in key_whitelist):
-                if isinstance(v, str):
-                    out.append(v)
-                elif isinstance(v, list):
-                    for it in v:
-                        if isinstance(it, str): out.append(it)
-                        elif isinstance(it, dict):
-                            for subk, subv in it.items():
-                                if isinstance(subv, str): out.append(subv)
-                elif isinstance(v, dict):
-                    for subk, subv in v.items():
-                        if isinstance(subv, str): out.append(subv)
-            _walk_collect(v, out, key_whitelist)
-    elif isinstance(d, list):
-        for it in d:
-            _walk_collect(it, out, key_whitelist)
-
-def extract_wanted_from_next(driver) -> str:
-    raw_json = None
+def extract_wanted_from_next_html(html: str) -> str:
     try:
-        raw_json = driver.execute_script("return window.__NEXT_DATA__ || null;")
+        soup = BeautifulSoup(html or "", "html.parser")
+        tag = soup.select_one("script#__NEXT_DATA__")
+        if not tag:
+            return ""
+        raw = (tag.string or tag.text or "").strip()
+        data = json.loads(raw)
     except Exception:
-        pass
-    if raw_json is None:
-        try:
-            raw = driver.execute_script("""
-                const s=document.querySelector('script#__NEXT_DATA__');
-                return s ? s.textContent : null;
-            """)
-            if raw:
-                raw_json = json.loads(raw)
-        except Exception:
-            raw_json = None
-    if not raw_json:
         return ""
 
     key_whitelist = [
@@ -261,14 +229,39 @@ def extract_wanted_from_next(driver) -> str:
         "prefer","plus","nice",
         "benefit","welfare","perk"
     ]
+
+    def _safe_text(x): return re.sub(r"\s+", " ", (x or "")).strip()
+
+    def _walk(d, out):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                kl = str(k).lower()
+                if any(t in kl for t in key_whitelist):
+                    if isinstance(v, str):
+                        out.append(v)
+                    elif isinstance(v, list):
+                        for it in v:
+                            if isinstance(it, str): out.append(it)
+                            elif isinstance(it, dict):
+                                for _, subv in it.items():
+                                    if isinstance(subv, str): out.append(subv)
+                    elif isinstance(v, dict):
+                        for _, subv in v.items():
+                            if isinstance(subv, str): out.append(subv)
+                _walk(v, out)
+        elif isinstance(d, list):
+            for it in d:
+                _walk(it, out)
+
     bucket = []
-    _walk_collect(raw_json, bucket, key_whitelist)
+    _walk(data, bucket)
+
     lines, seen = [], set()
     for t in bucket:
         s = _safe_text(t)
         if len(s) > 2 and s not in seen:
             seen.add(s); lines.append(s)
-    return "\n".join(lines[:300])
+    return "\n".join(lines[:400])
 
 # -----------------------------------------------------------------------------
 # Selenium 전용 페이지 수집
@@ -305,38 +298,40 @@ def selenium_only_get_html(url: str, timeout: int = 14) -> str:
                 break
 
         html = driver.page_source or ""
-
-        # ▶ Wanted면 NEXT_DATA 텍스트도 합쳐서 반환
-        if "wanted.co.kr" in host:
-            try:
-                nxt = extract_wanted_from_next(driver)
-                if nxt:
-                    safe = "\n".join([f"<!--NEXT:{line}-->" for line in nxt.split("\n")])
-                    html = html + "\n" + safe
-            except Exception:
-                pass
-
         return html
     finally:
         try: driver.quit()
         except Exception: pass
 
 def fetch_all_text_selenium_only(url: str, timeout: int = 14) -> Tuple[str, Dict, Optional[str]]:
-    url = normalize_url(url)
-    if not url:
+    url_n = normalize_url(url)
+    if not url_n:
         return "", {"error": "invalid_url"}, None
     try:
-        html_dyn = selenium_only_get_html(url, timeout=timeout)
+        html_dyn = selenium_only_get_html(url_n, timeout=timeout)
     except Exception as e:
         st.error(f"Selenium 드라이버 시작/로드 실패: {e}")
         st.code("".join(traceback.format_exc()))
-        return "", {"source": "selenium_error", "len": 0, "url_final": url}, None
+        return "", {"source": "selenium_error", "len": 0, "url_final": url_n}, None
 
     if not html_dyn or len(html_dyn) < 200:
-        return "", {"source": "selenium_failed", "len": 0, "url_final": url}, None
+        return "", {"source": "selenium_failed", "len": 0, "url_final": url_n}, None
 
-    txt = html_to_text(html_dyn)
-    return txt, {"source": "selenium", "len": len(txt), "url_final": url}, html_dyn
+    # 1) DOM → 텍스트
+    txt_dom = html_to_text(html_dyn)
+
+    # 2) Wanted면 __NEXT_DATA__도 파싱해서 텍스트에 직접 덧붙임
+    host = urllib.parse.urlsplit(url_n).netloc.lower()
+    txt_next = ""
+    if "wanted.co.kr" in host:
+        try:
+            txt_next = extract_wanted_from_next_html(html_dyn)
+        except Exception:
+            txt_next = ""
+
+    # 3) 최종 병합
+    final_txt = (txt_dom + ("\n\n" + txt_next if txt_next else "")).strip()
+    return final_txt, {"source": "selenium", "len": len(final_txt), "url_final": url_n}, html_dyn
 
 # -----------------------------------------------------------------------------
 # 메타/정제/규칙 기반
