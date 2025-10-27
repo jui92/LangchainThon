@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY, Selenium Manager, no-lxml)
+# Job Helper Bot (Selenium-ONLY, Selenium Manager, no-lxml, Wanted-patch)
 # - 자소서/질문/채점
 # - 오직 Selenium으로 채용 공고 수집 (폴백 없음)
 # - lxml 미사용 (BeautifulSoup: html.parser)
 # - 드라이버는 Selenium Manager가 자동 관리 (chromium만 설치되어 있으면 됨)
+# - Wanted(https://www.wanted.co.kr) 페이지: DOM + __NEXT_DATA__에서 텍스트 수집
 ################################################################################
 
 import os, re, json, urllib.parse, time, io, tempfile, shutil, traceback
@@ -64,7 +65,7 @@ with st.sidebar:
     st.subheader("모델 & 옵션")
     CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
     EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
-    SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 12)
+    SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 14)
 
 # -----------------------------------------------------------------------------
 # html2text
@@ -102,7 +103,6 @@ def html_to_text(html_str: str) -> str:
 # Selenium 빌더
 # -----------------------------------------------------------------------------
 def _pick_chrome_binary() -> Optional[str]:
-    # 패키지 설치로 보통 /usr/bin/chromium 에 존재
     cands = [
         os.getenv("CHROME_BIN"),
         os.getenv("GOOGLE_CHROME_BIN"),
@@ -137,7 +137,7 @@ def _build_chrome(headless: bool = True):
     return driver
 
 # -----------------------------------------------------------------------------
-# 도메인별 확장 클릭
+# 공통 클릭 유틸
 # -----------------------------------------------------------------------------
 def _click_by_text_candidates(driver, texts: List[str]):
     for t in texts:
@@ -146,7 +146,7 @@ def _click_by_text_candidates(driver, texts: List[str]):
             xpath_contains = f"//*[contains(normalize-space(text()), '{t}')]"
             for xp in (xpath_exact, xpath_contains):
                 els = driver.find_elements(By.XPATH, xp)
-                for el in els[:8]:
+                for el in els[:12]:
                     try:
                         driver.execute_script("arguments[0].click();", el)
                         time.sleep(0.25)
@@ -155,7 +155,7 @@ def _click_by_text_candidates(driver, texts: List[str]):
         except Exception:
             continue
 
-def _click_many(driver, css_list, limit_per_selector=8):
+def _click_many(driver, css_list, limit_per_selector=12):
     for css in css_list:
         try:
             els = driver.find_elements(By.CSS_SELECTOR, css)
@@ -168,16 +168,28 @@ def _click_many(driver, css_list, limit_per_selector=8):
         except Exception:
             continue
 
+# -----------------------------------------------------------------------------
+# 도메인별 확장 클릭 (Wanted 강화)
+# -----------------------------------------------------------------------------
 def _expand_wanted(driver):
     selectors = [
         "[data-qa='btn-read-more']",
-        "[aria-expanded='false']",
-        "[role='button']",
-        "button[class*='Read'], a[class*='Read']",
-        "button[class*='More'], a[class*='More']",
+        "[data-qa='job-header__more']",
+        "button[aria-expanded='false']",
+        "[role='button'][class*='More']",
+        "div[aria-expanded='false']",
     ]
-    _click_many(driver, selectors)
-    _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "기업정보"])
+    _click_many(driver, selectors, limit_per_selector=12)
+    _click_by_text_candidates(driver, [
+        "더보기","전체보기","자세히","상세보기","모두 보기",
+        "주요업무","자격요건","우대사항","기업/팀 소개","혜택 및 복지",
+        "나중에 하기","닫기","확인"
+    ])
+    for _ in range(10):
+        try:
+            driver.execute_script("window.scrollBy(0, 1200);"); time.sleep(0.2)
+        except Exception:
+            break
 
 def _expand_saramin(driver):
     selectors = [
@@ -186,7 +198,7 @@ def _expand_saramin(driver):
         "button[class*='more'], a[class*='more']"
     ]
     _click_many(driver, selectors)
-    _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "기업정보", "상세정보"])
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세정보"])
 
 def _expand_jobkorea(driver):
     selectors = [
@@ -195,12 +207,73 @@ def _expand_jobkorea(driver):
         "button[class*='More'], a[class*='More']"
     ]
     _click_many(driver, selectors)
-    _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "기업정보", "상세보기"])
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"])
+
+# -----------------------------------------------------------------------------
+# Wanted: __NEXT_DATA__에서 텍스트 추출
+# -----------------------------------------------------------------------------
+def _safe_text(x): return re.sub(r"\s+", " ", (x or "")).strip()
+
+def _walk_collect(d, out, key_whitelist):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            kl = str(k).lower()
+            if any(t in kl for t in key_whitelist):
+                if isinstance(v, str):
+                    out.append(v)
+                elif isinstance(v, list):
+                    for it in v:
+                        if isinstance(it, str): out.append(it)
+                        elif isinstance(it, dict):
+                            for subk, subv in it.items():
+                                if isinstance(subv, str): out.append(subv)
+                elif isinstance(v, dict):
+                    for subk, subv in v.items():
+                        if isinstance(subv, str): out.append(subv)
+            _walk_collect(v, out, key_whitelist)
+    elif isinstance(d, list):
+        for it in d:
+            _walk_collect(it, out, key_whitelist)
+
+def extract_wanted_from_next(driver) -> str:
+    raw_json = None
+    try:
+        raw_json = driver.execute_script("return window.__NEXT_DATA__ || null;")
+    except Exception:
+        pass
+    if raw_json is None:
+        try:
+            raw = driver.execute_script("""
+                const s=document.querySelector('script#__NEXT_DATA__');
+                return s ? s.textContent : null;
+            """)
+            if raw:
+                raw_json = json.loads(raw)
+        except Exception:
+            raw_json = None
+    if not raw_json:
+        return ""
+
+    key_whitelist = [
+        "job","position","title","desc","description",
+        "responsibilit","duty","role",
+        "require","qualification",
+        "prefer","plus","nice",
+        "benefit","welfare","perk"
+    ]
+    bucket = []
+    _walk_collect(raw_json, bucket, key_whitelist)
+    lines, seen = [], set()
+    for t in bucket:
+        s = _safe_text(t)
+        if len(s) > 2 and s not in seen:
+            seen.add(s); lines.append(s)
+    return "\n".join(lines[:300])
 
 # -----------------------------------------------------------------------------
 # Selenium 전용 페이지 수집
 # -----------------------------------------------------------------------------
-def selenium_only_get_html(url: str, timeout: int = 12) -> str:
+def selenium_only_get_html(url: str, timeout: int = 14) -> str:
     driver = _build_chrome(headless=True)
     try:
         driver.set_page_load_timeout(timeout)
@@ -213,8 +286,8 @@ def selenium_only_get_html(url: str, timeout: int = 12) -> str:
         host = urllib.parse.urlsplit(url).netloc.lower()
 
         # 공통 확장 시도
-        _click_by_text_candidates(driver, ["더보기", "상세보기", "자세히 보기", "자세히", "전체보기", "펼치기", "모두 보기", "Read more", "More"])
-        _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "Requirements", "Responsibilities", "Preferred"])
+        _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","자세히","전체보기","펼치기","모두 보기","Read more","More"])
+        _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"])
 
         # 도메인 전용 확장
         if "wanted.co.kr" in host:
@@ -227,16 +300,28 @@ def selenium_only_get_html(url: str, timeout: int = 12) -> str:
         # 지연로딩 대비 스크롤
         for _ in range(6):
             try:
-                driver.execute_script("window.scrollBy(0, 1000);"); time.sleep(0.25)
+                driver.execute_script("window.scrollBy(0, 1000);"); time.sleep(0.2)
             except Exception:
                 break
 
-        return driver.page_source or ""
+        html = driver.page_source or ""
+
+        # ▶ Wanted면 NEXT_DATA 텍스트도 합쳐서 반환
+        if "wanted.co.kr" in host:
+            try:
+                nxt = extract_wanted_from_next(driver)
+                if nxt:
+                    safe = "\n".join([f"<!--NEXT:{line}-->" for line in nxt.split("\n")])
+                    html = html + "\n" + safe
+            except Exception:
+                pass
+
+        return html
     finally:
         try: driver.quit()
         except Exception: pass
 
-def fetch_all_text_selenium_only(url: str, timeout: int = 12) -> Tuple[str, Dict, Optional[str]]:
+def fetch_all_text_selenium_only(url: str, timeout: int = 14) -> Tuple[str, Dict, Optional[str]]:
     url = normalize_url(url)
     if not url:
         return "", {"error": "invalid_url"}, None
