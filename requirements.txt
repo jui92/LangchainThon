@@ -20,9 +20,8 @@ chardet>=5.2.0
 matplotlib>=3.8.0
 
 # === 동적 크롤링 (Selenium) ===
-selenium>=4.22.0
-webdriver-manager>=4.0.1
+selenium>=4.25.0
+webdriver-manager>=4.0.2
 
 # === (Optional) Naver API 호출 시 필요 ===
 # NAVER_CLIENT_ID, NAVER_CLIENT_SECRET 환경변수 필요
-
