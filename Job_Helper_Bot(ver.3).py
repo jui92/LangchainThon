@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY + Speed-up + Follow-up restored)
+# Job Helper Bot (Selenium-ONLY + Speed-up + Follow-up + Wanted NEXT fix)
 # - 채용 포털 URL + (선택) 기업 홈페이지 URL + 최신 뉴스 → 모의면접/자소서
 # - Selenium 전용 수집(원티드 Next.js __NEXT_DATA__ 병합), 규칙 파서 보강
 # - 속도 개선: Fast 모드, 동시 처리(ThreadPoolExecutor), 캐시(st.cache_data)
-# - 팔로업 질문 · 답변 · 피드백 UI 복원
+# - 팔로업 질문 · 답변 · 피드백 UI 포함
 ################################################################################
 
 import os, re, io, json, time, shutil, urllib.parse, tempfile, traceback
@@ -62,7 +62,7 @@ with st.sidebar:
     EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 14)
     FAST_MODE = st.toggle("Fast 모드(확장 최소화, 더 빠름)", value=True)
-    st.caption("Fast 모드: 클릭/스크롤 시도 횟수를 줄여 속도를 높입니다.")
+    st.caption("Fast 모드: 클릭/스크롤 시도 횟수를 줄여 속도를 높입니다(이번 버전은 강도도 상향).")
 
 # -----------------------------------------------------------------------------
 # html2text
@@ -137,7 +137,7 @@ def _click_by_text_candidates(driver, texts: List[str], per=12):
                 for el in els[:per]:
                     try:
                         driver.execute_script("arguments[0].click();", el)
-                        time.sleep(0.15 if FAST_MODE else 0.25)
+                        time.sleep(0.12 if FAST_MODE else 0.25)
                     except Exception:
                         continue
         except Exception:
@@ -150,7 +150,7 @@ def _click_many_css(driver, selectors: List[str], per=12):
             for el in els[:per]:
                 try:
                     driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.12 if FAST_MODE else 0.2)
+                    time.sleep(0.1 if FAST_MODE else 0.2)
                 except Exception:
                     continue
         except Exception:
@@ -162,24 +162,24 @@ def _expand_wanted(driver):
         "button[aria-expanded='false']","[role='button'][class*='More']",
         "div[aria-expanded='false']",
     ]
-    _click_many_css(driver, sel, per=(5 if FAST_MODE else 12))
+    _click_many_css(driver, sel, per=(8 if FAST_MODE else 12))
     _click_by_text_candidates(driver, [
         "더보기","전체보기","자세히","상세보기","모두 보기",
         "주요업무","자격요건","우대사항","기업/팀 소개","혜택 및 복지",
         "나중에 하기","닫기","확인"
-    ])
+    ], per=(6 if FAST_MODE else 12))
 
 def _expand_saramin(driver):
     sel = [".btn_more",".btnMore",".btn-detail",".btn_toggle",
            "[aria-expanded='false']","[role='button']","button[class*='more'], a[class*='more']"]
-    _click_many_css(driver, sel, per=(4 if FAST_MODE else 12))
-    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세정보"])
+    _click_many_css(driver, sel, per=(6 if FAST_MODE else 12))
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세정보"], per=(6 if FAST_MODE else 12))
 
 def _expand_jobkorea(driver):
     sel = [".btnFold",".btnToggleRead",".btn_more",
            "[aria-expanded='false']","[role='button']","button[class*='More'], a[class*='More']"]
-    _click_many_css(driver, sel, per=(4 if FAST_MODE else 12))
-    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"])
+    _click_many_css(driver, sel, per=(6 if FAST_MODE else 12))
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"], per=(6 if FAST_MODE else 12))
 
 # -----------------------------------------------------------------------------
 # Wanted __NEXT_DATA__ → text
@@ -224,7 +224,7 @@ def extract_wanted_from_next_html(html: str) -> str:
         s=_safe(t)
         if len(s)>2 and s not in seen:
             seen.add(s); lines.append(s)
-    return "\n".join(lines[:600])
+    return "\n".join(lines[:900])  # 상한 900로 상향
 
 # -----------------------------------------------------------------------------
 # Selenium fetch (DOM + NEXT_DATA)
@@ -240,29 +240,32 @@ def selenium_get_html(url: str, timeout: int = 14) -> str:
             pass
 
         host = urllib.parse.urlsplit(url).netloc.lower()
-        # light expand first
-        _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","전체보기","Read more","More"], per=(3 if FAST_MODE else 8))
-        _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"], per=(3 if FAST_MODE else 8))
+        # 공통 확장(강도 ↑)
+        _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","전체보기","Read more","More"],
+                                  per=(6 if FAST_MODE else 10))
+        _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"],
+                                  per=(6 if FAST_MODE else 10))
 
         if "wanted.co.kr" in host: _expand_wanted(driver)
         if "saramin" in host:     _expand_saramin(driver)
         if "jobkorea" in host:    _expand_jobkorea(driver)
 
-        # scrolls
-        loops = 3 if FAST_MODE else 7
+        # 스크롤(강도 ↑)
+        loops = 5 if FAST_MODE else 8
         for _ in range(loops):
             try:
-                driver.execute_script("window.scrollBy(0, 1200);"); time.sleep(0.15 if FAST_MODE else 0.25)
+                driver.execute_script("window.scrollBy(0, 1200);"); time.sleep(0.12 if FAST_MODE else 0.25)
             except Exception:
                 break
 
         html = driver.page_source or ""
-        # Wanted extra
+        # Wanted extra → html에 <p>로 주입(주석 금지)
         if "wanted.co.kr" in host:
             try:
                 txt_next = extract_wanted_from_next_html(html)
                 if txt_next:
-                    html += "\n<!-- TEXT_MERGE_SPLIT -->\n" + "\n".join([f"<p>{line}</p>" for line in txt_next.split("\n")])
+                    html += "\n<div id='__WANTED_NEXT_EXTRACT__'>" + \
+                            "".join([f"<p>{line}</p>" for line in txt_next.split("\n")]) + "</div>"
             except Exception:
                 pass
         return html
@@ -570,7 +573,8 @@ def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
         seen.add(url)
         html = _http_get(url, timeout=6)
         if not html: continue
-        soup = BeautifulSoup(html, "lxml")
+        # 회사 페이지는 lxml이 빠름(있으면 사용)
+        soup = BeautifulSoup(html, "lxml") if "lxml" in str(BeautifulSoup).lower() else BeautifulSoup(html, "html.parser")
         texts=[]
         for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
             t = tag.get_text(" ", strip=True)
@@ -696,14 +700,21 @@ if clean:
     st.markdown(f"**모집 분야(직무명):** {clean.get('job_title','-')}")
     c1,c2,c3 = st.columns(3)
     with c1:
-        st.markdown("**주요 업무**");   [st.markdown(f"- {b}") for b in clean.get("responsibilities", [])]
+        st.markdown("**주요 업무**")
+        for b in clean.get("responsibilities", []):
+            st.markdown(f"- {b}")
     with c2:
-        st.markdown("**자격 요건**");   [st.markdown(f"- {b}") for b in clean.get("qualifications", [])]
+        st.markdown("**자격 요건**")
+        for b in clean.get("qualifications", []):
+            st.markdown(f"- {b}")
     with c3:
         st.markdown("**우대 사항**")
         prefs = clean.get("preferences", [])
-        if prefs: [st.markdown(f"- {b}") for b in prefs]
-        else: st.caption("우대 사항이 명시되지 않았습니다.")
+        if prefs:
+            for b in prefs:
+                st.markdown(f"- {b}")
+        else:
+            st.caption("우대 사항이 명시되지 않았습니다.")
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
@@ -714,12 +725,16 @@ if st.session_state.company_vision or st.session_state.company_talent or st.sess
     vcol, tcol = st.columns(2)
     with vcol:
         st.markdown("**비전/핵심가치**")
-        for v in st.session_state.company_vision[:8]: st.markdown(f"- {v}")
-        if not st.session_state.company_vision: st.caption("비전/핵심가치를 찾지 못했습니다.")
+        for v in st.session_state.company_vision[:8]:
+            st.markdown(f"- {v}")
+        if not st.session_state.company_vision:
+            st.caption("비전/핵심가치를 찾지 못했습니다.")
     with tcol:
         st.markdown("**인재상**")
-        for t in st.session_state.company_talent[:8]: st.markdown(f"- {t}")
-        if not st.session_state.company_talent: st.caption("인재상 정보를 찾지 못했습니다.")
+        for t in st.session_state.company_talent[:8]:
+            st.markdown(f"- {t}")
+        if not st.session_state.company_talent:
+            st.caption("인재상 정보를 찾지 못했습니다.")
     if st.session_state.company_news:
         st.markdown("**최신 뉴스(상위 3~5)**")
         for n in st.session_state.company_news[:5]:
@@ -816,7 +831,8 @@ if st.button("자소서 생성", type="primary"):
     else:
         with st.spinner("자소서 생성 중..."):
             cover = build_cover_letter(st.session_state.clean_struct, st.session_state.resume_raw, topic, CHAT_MODEL)
-        st.subheader("자소서 (생성 결과)"); st.write(cover)
+        st.subheader("자소서 (생성 결과)")
+        st.write(cover)
         st.download_button("자소서 TXT 다운로드", data=cover.encode("utf-8"),
                            file_name="cover_letter.txt", mime="text/plain")
 
@@ -897,20 +913,27 @@ if last:
     for it in last.get("criteria", []):
         st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
     if last.get("strengths"):
-        st.markdown("**강점**"); [st.markdown(f"- {s}") for s in last["strengths"]]
+        st.markdown("**강점**")
+        for s in last["strengths"]:
+            st.markdown(f"- {s}")
     if last.get("risks"):
-        st.markdown("**감점 요인/리스크**"); [st.markdown(f"- {r}") for r in last["risks"]]
+        st.markdown("**감점 요인/리스크**")
+        for r in last["risks"]:
+            st.markdown(f"- {r}")
     if last.get("improvements"):
-        st.markdown("**개선 포인트**"); [st.markdown(f"- {im}") for im in last["improvements"]]
+        st.markdown("**개선 포인트**")
+        for im in last["improvements"]:
+            st.markdown(f"- {im}")
     if last.get("revised_answer"):
-        st.markdown("**수정본 답변(STAR)**"); st.write(last["revised_answer"])
+        st.markdown("**수정본 답변(STAR)**")
+        st.write(last["revised_answer"])
 else:
     st.info("아직 채점 결과가 없습니다.")
 
 st.divider()
 
 # -----------------------------------------------------------------------------
-# UI 7) 팔로업 질문 · 답변 · 피드백 (복원)
+# UI 7) 팔로업 질문 · 답변 · 피드백
 # -----------------------------------------------------------------------------
 st.subheader("팔로업 질문 · 답변 · 피드백")
 
@@ -937,7 +960,8 @@ if last and not st.session_state.followups:
 if last:
     if st.session_state.followups:
         st.markdown("**팔로업 질문 제안**")
-        for i, f in enumerate(st.session_state.followups, 1): st.markdown(f"- ({i}) {f}")
+        for i, f in enumerate(st.session_state.followups, 1):
+            st.markdown(f"- ({i}) {f}")
         st.selectbox("채점 받을 팔로업 질문 선택", st.session_state.followups, index=0, key="selected_followup")
         st.text_area("팔로업 질문에 대한 나의 답변", key="followup_answer", height=160)
         if st.button("팔로업 채점 & 피드백", type="secondary"):
@@ -955,6 +979,7 @@ if last:
                 for it in res_fu.get("criteria", []):
                     st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
                 if res_fu.get("revised_answer",""):
-                    st.markdown("**팔로업 수정본(STAR)**"); st.write(res_fu["revised_answer"])
+                    st.markdown("**팔로업 수정본(STAR)**")
+                    st.write(res_fu["revised_answer"])
     else:
         st.caption("팔로업 질문은 메인 질문 채점 직후 자동 제안됩니다.")
