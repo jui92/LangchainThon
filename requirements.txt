@@ -16,3 +16,9 @@ python-docx>=1.1.2
 # 동적 크롤링 (웹페이지의 자바스크립트 실행 및 '더보기' 버튼 클릭)
 selenium>=4.22.0
 webdriver-manager>=4.0.1
+
+# status 127
+libglib2.0-0
+libnss3
+libfontconfig1
+libgconf-2-4
