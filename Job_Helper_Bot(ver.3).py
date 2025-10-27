@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY + NEXT_DATA merge + Speed-up)
-# - 주요업무 / 자격요건 / 우대사항(ONLY) 으로 정리
+# Job Helper Bot (Selenium ONLY + NEXT_DATA merge + Speed-up)
+# - 출력 필드: 주요업무 / 자격요건 / 우대사항 (복지/혜택 제거)
 # - Selenium 전용 수집(원티드 __NEXT_DATA__ 병합), 규칙 파서 보강
 # - Fast 모드, 동시 처리(ThreadPoolExecutor), 캐시(st.cache_data)
-# - 기업 홈페이지(비전/인재상), 뉴스, 자소서, 질문/답변/채점/팔로업 포함
+# - 회사 홈페이지(비전/인재상), 뉴스(회사명 수동 입력 지원)
+# - 자소서 생성, 질문/답변/채점/팔로업
 ################################################################################
 
 import os, re, io, json, time, shutil, urllib.parse, tempfile, traceback
@@ -636,11 +637,12 @@ def _init_state():
 _init_state()
 
 # -----------------------------------------------------------------------------
-# UI 1) 채용 공고 URL + (선택) 기업 홈페이지 URL
+# UI 1) 채용 공고 URL + (선택) 기업 홈페이지 URL + 회사명 수동 입력
 # -----------------------------------------------------------------------------
 st.header("1) 채용 공고 URL (Selenium 전용)")
 job_url = st.text_input("채용 공고 상세 URL", placeholder="원티드/사람인/잡코리아/기업 채용 페이지 URL")
 st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력하세요.")
+company_name_override = st.text_input("회사명 수동 입력 (선택)", placeholder="예: 카카오헬스케어")
 
 if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
     if not job_url.strip():
@@ -655,14 +657,21 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
         if not raw:
             st.error("수집 실패(로그인/동적 렌더링/봇 차단 가능).")
         else:
+            # 동시 처리: LLM 정제 + (홈페이지/뉴스)
             with st.spinner("정제 및 부가정보 수집 중..."):
                 tasks=[]
                 with ThreadPoolExecutor(max_workers=3) as ex:
                     tasks.append(("clean", ex.submit(llm_structurize, raw, hint, CHAT_MODEL)))
                     if st.session_state.company_home.strip():
                         tasks.append(("pages", ex.submit(fetch_company_pages, st.session_state.company_home.strip())))
-                    cname = hint.get("company_name","")
-                    tasks.append(("news", ex.submit(google_news_rss, cname, 5)))
+                    # 뉴스용 회사명 우선순위: 수동 입력 > 힌트 > (정제 결과) > 도메인 추정
+                    domain_fallback = ""
+                    try:
+                        domain_fallback = urllib.parse.urlsplit(job_url).netloc.split(":")[0].split(".")[0]
+                    except Exception:
+                        pass
+                    cname_hint = (company_name_override.strip() if company_name_override.strip() else hint.get("company_name","").strip())
+                    tasks.append(("news", ex.submit(google_news_rss, cname_hint or domain_fallback, 5)))
 
                     clean=None; vis=[]; tal=[]; news=[]
                     for name, fut in tasks:
@@ -674,11 +683,13 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
                             elif name=="news": news = res or []
                         except Exception:
                             continue
+
                 # 규칙 파서 보강
                 if clean:
                     rb = rule_based_sections(raw)
                     if not clean.get("preferences") and rb.get("preferences"):
                         clean["preferences"]=rb["preferences"]
+
                 st.session_state.clean_struct = clean
                 st.session_state.company_vision = vis
                 st.session_state.company_talent = tal
@@ -714,27 +725,35 @@ if clean:
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
-# 비전/인재상/뉴스
-if st.session_state.company_vision or st.session_state.company_talent or st.session_state.company_news:
-    st.divider()
-    st.subheader("회사 비전/인재상 & 최신 이슈")
-    vcol, tcol = st.columns(2)
-    with vcol:
-        st.markdown("**비전/핵심가치**")
+# -----------------------------------------------------------------------------
+# UI 2.5) 회사 비전/인재상 & 최신 이슈  (항상 렌더)
+# -----------------------------------------------------------------------------
+st.divider()
+st.subheader("회사 비전/인재상 & 최신 이슈")
+
+vcol, tcol = st.columns(2)
+with vcol:
+    st.markdown("**비전/핵심가치**")
+    if st.session_state.company_vision:
         for v in st.session_state.company_vision[:8]:
             st.markdown(f"- {v}")
-        if not st.session_state.company_vision:
-            st.caption("비전/핵심가치를 찾지 못했습니다.")
-    with tcol:
-        st.markdown("**인재상**")
+    else:
+        st.caption("비전/핵심가치를 찾지 못했습니다. (회사 홈페이지 URL을 입력해 보세요)")
+
+with tcol:
+    st.markdown("**인재상**")
+    if st.session_state.company_talent:
         for t in st.session_state.company_talent[:8]:
             st.markdown(f"- {t}")
-        if not st.session_state.company_talent:
-            st.caption("인재상 정보를 찾지 못했습니다.")
-    if st.session_state.company_news:
-        st.markdown("**최신 뉴스(상위 3~5)**")
-        for n in st.session_state.company_news[:5]:
-            st.markdown(f"- [{n.get('title','(제목 없음)')}]({n.get('link','#')})")
+    else:
+        st.caption("인재상 정보를 찾지 못했습니다.")
+
+st.markdown("**최신 뉴스(상위 3~5)**")
+if st.session_state.company_news:
+    for n in st.session_state.company_news[:5]:
+        st.markdown(f"- [{n.get('title','(제목 없음)')}]({n.get('link','#')})")
+else:
+    st.caption("뉴스 결과가 없습니다. 회사명을 수동 입력해 보세요.")
 
 st.divider()
 
