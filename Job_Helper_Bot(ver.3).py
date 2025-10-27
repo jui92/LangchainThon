@@ -232,7 +232,6 @@ def _build_chrome(headless: bool = True):
 def _click_by_text_candidates(driver, texts: List[str], timeout=4):
     for t in texts:
         try:
-            # 정확/부분 일치 모두 시도
             xpath_exact = f"//*[normalize-space(text())='{t}']"
             xpath_contains = f"//*[contains(normalize-space(text()), '{t}')]"
             for xp in (xpath_exact, xpath_contains):
@@ -253,17 +252,14 @@ def selenium_expand_then_get_html(url: str, timeout: int = 8) -> str:
     try:
         driver.set_page_load_timeout(timeout)
         driver.get(url)
-        # 최소 로딩 대기
         try:
             WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, "//*")))
         except TimeoutException:
             pass
 
-        # 공통 “더보기/상세/우대” 후보 텍스트 클릭
         _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","자세히","전체보기","펼치기","모두 보기","Read more","More"], timeout=timeout)
         _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"], timeout=timeout)
 
-        # 공통 CSS 후보(접힘 토글)
         candidates = [
             "[aria-expanded='false']","[aria-controls]","[role='button']",
             ".more, .MoreButton, .btn-more, .btn_more, .fold, .expand, .toggle",
@@ -283,7 +279,6 @@ def selenium_expand_then_get_html(url: str, timeout: int = 8) -> str:
             except Exception:
                 continue
 
-        # 스크롤 (지연로딩 방지)
         for _ in range(4):
             try:
                 driver.execute_script("window.scrollBy(0, 900);"); time.sleep(0.2)
@@ -310,7 +305,6 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
     if not url:
         return "", {"error":"invalid_url"}, None
 
-    # a) Selenium 먼저 (옵션 On)
     if use_selenium and SELENIUM_AVAILABLE:
         try:
             html_dyn = selenium_expand_then_get_html(url, timeout=timeout)
@@ -320,7 +314,6 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
         except Exception:
             pass
 
-    # b) Jina proxy
     try:
         parts = urllib.parse.urlsplit(url)
         prox = f"https://r.jina.ai/http://{parts.netloc}{parts.path}"
@@ -333,13 +326,11 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
     except Exception:
         pass
 
-    # c) 일반 GET → html2text
     r = http_get(url, timeout=timeout)
     if r:
         txt = html_to_text(r.text)
         return txt, {"source":"webbase","len":len(txt),"url_final":url}, r.text
 
-    # d) BS4 fallback
     r2 = http_get(url, timeout=timeout)
     if r2:
         soup = BeautifulSoup(r2.text, "lxml")
@@ -472,7 +463,6 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
                 seen.add(t); clean.append(t[:180])
         data[k] = clean[:12]
 
-    # 우대가 비어있으면 규칙 기반 보완
     if len(data.get("preferences", [])) < 1:
         rb = rule_based_sections(ctx)
         if rb.get("preferences"):
@@ -730,7 +720,6 @@ if st.button("원문 수집 → 정제", type="primary"):
             with st.spinner("LLM으로 정제 중..."):
                 clean = llm_structurize(raw, hint, CHAT_MODEL)
 
-            # 규칙 기반 우대사항 보완
             if not clean.get("preferences"):
                 rb = rule_based_sections(raw)
                 if rb.get("preferences"):
@@ -738,7 +727,6 @@ if st.button("원문 수집 → 정제", type="primary"):
 
             st.session_state.clean_struct = clean
 
-            # 회사 비전/인재상/뉴스
             if ENABLE_COMPANY_ENRICH:
                 with st.spinner("회사 비전/인재상/뉴스 수집 중..."):
                     vis, tal, news = [], [], []
@@ -795,7 +783,6 @@ if clean:
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
-# 회사 비전/인재상/뉴스 표시
 if ENABLE_COMPANY_ENRICH and (st.session_state.company_vision or st.session_state.company_talent or st.session_state.company_news):
     st.divider()
     st.subheader("회사 비전/인재상 & 최신 이슈")
