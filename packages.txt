@@ -1,0 +1,7 @@
+chromium
+chromium-driver
+fonts-liberation
+libnss3
+libasound2
+libxss1
+libgbm1
