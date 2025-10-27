@@ -30,6 +30,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+import shutil, pathlib
 
 # -----------------------------------------------------------------------------
 # Streamlit 기본 설정
@@ -103,10 +105,34 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--window-size=1440,2400")
     opts.add_argument("--lang=ko-KR")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+
+    # ▶ 크롬 바이너리 자동 탐지 (Streamlit Cloud/서버 환경 대비)
+    candidates = [
+        os.getenv("GOOGLE_CHROME_BIN"),
+        os.getenv("CHROME_BIN"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium-browser"),
+        shutil.which("chromium"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            opts.binary_location = p
+            break
+
+    # ▶ webdriver-manager + Service 사용 (Selenium 4 권장 방식)
     try:
-        driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
+        driver_path = ChromeDriverManager().install()
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=opts)
     except WebDriverException:
+        # 셀레니움 매니저(내장) 시도 — 로컬에 크롬이 있을 때만 작동
         driver = webdriver.Chrome(options=opts)
+
+    # (가능한 환경에서) 헤드리스 탐지 회피
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -114,6 +140,7 @@ def _build_chrome(headless: bool = True):
     except Exception:
         pass
     return driver
+
 
 def _click_by_text_candidates(driver, texts: List[str]):
     for t in texts:
