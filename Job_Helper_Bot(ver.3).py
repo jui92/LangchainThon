@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY + NEXT_DATA merge + Speed-up + Benefits split)
-# - 채용 포털 URL + (선택) 기업 홈페이지 URL + 최신 뉴스 → 모의면접/자소서
-# - Selenium 전용 수집(원티드 Next.js __NEXT_DATA__ 병합), 규칙 파서 보강
-# - 속도 개선: Fast 모드, 동시 처리(ThreadPoolExecutor), 캐시(st.cache_data)
-# - 팔로업 질문 · 답변 · 피드백 UI
-# - 우대(preferences)와 복지/혜택(benefits) 완전 분리
+# Job Helper Bot (Selenium-ONLY + NEXT_DATA merge + Speed-up)
+# - 주요업무 / 자격요건 / 우대사항(ONLY) 으로 정리
+# - Selenium 전용 수집(원티드 __NEXT_DATA__ 병합), 규칙 파서 보강
+# - Fast 모드, 동시 처리(ThreadPoolExecutor), 캐시(st.cache_data)
+# - 기업 홈페이지(비전/인재상), 뉴스, 자소서, 질문/답변/채점/팔로업 포함
 ################################################################################
 
 import os, re, io, json, time, shutil, urllib.parse, tempfile, traceback
@@ -26,7 +25,7 @@ except ImportError:
     st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
     st.stop()
 
-# Selenium (Selenium Manager 사용)
+# Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
@@ -52,7 +51,7 @@ st.title("Job Helper Bot : 자소서 생성 / 모의 면접")
 
 API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
 if not API_KEY:
-    API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password", help="OpenAI API 키가 필요합니다.")
+    API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
 if not API_KEY:
     st.stop()
 client = OpenAI(api_key=API_KEY)
@@ -62,8 +61,7 @@ with st.sidebar:
     CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
     EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 14)
-    FAST_MODE = st.toggle("Fast 모드(확장 최소화, 더 빠름)", value=True)
-    st.caption("Fast 모드: 클릭/스크롤 횟수를 줄여 속도를 높입니다(이번 버전은 강도 상향).")
+    FAST_MODE = st.toggle("Fast 모드(빠르게)", value=True)
 
 # -----------------------------------------------------------------------------
 # html2text
@@ -122,7 +120,7 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--lang=ko-KR")
     binpath = _pick_chrome_binary()
     if binpath: opts.binary_location = binpath
-    driver = webdriver.Chrome(options=opts)  # Selenium Manager 자동
+    driver = webdriver.Chrome(options=opts)  # Selenium Manager
     return driver
 
 # -----------------------------------------------------------------------------
@@ -166,7 +164,7 @@ def _expand_wanted(driver):
     _click_many_css(driver, sel, per=(8 if FAST_MODE else 12))
     _click_by_text_candidates(driver, [
         "더보기","전체보기","자세히","상세보기","모두 보기",
-        "주요업무","자격요건","우대사항","기업/팀 소개","혜택 및 복지",
+        "주요업무","자격요건","우대사항","기업/팀 소개",
         "나중에 하기","닫기","확인"
     ], per=(6 if FAST_MODE else 12))
 
@@ -197,9 +195,7 @@ def extract_wanted_from_next_html(html: str) -> str:
     key_whitelist = [
         "job","position","title","desc","description",
         "responsibilit","duty","role","skill","stack",
-        "require","qualification",
-        "prefer","plus","nice",
-        "benefit","welfare","perk"
+        "require","qualification","prefer","plus","nice"
     ]
     def _safe(x): return re.sub(r"\s+"," ", (x or "")).strip()
     def _walk(d, out):
@@ -225,7 +221,7 @@ def extract_wanted_from_next_html(html: str) -> str:
         s=_safe(t)
         if len(s)>2 and s not in seen:
             seen.add(s); lines.append(s)
-    return "\n".join(lines[:900])  # 상한 900
+    return "\n".join(lines[:900])
 
 # -----------------------------------------------------------------------------
 # Selenium fetch (DOM + NEXT_DATA)
@@ -241,7 +237,6 @@ def selenium_get_html(url: str, timeout: int = 14) -> str:
             pass
 
         host = urllib.parse.urlsplit(url).netloc.lower()
-        # 공통 확장(강도 ↑)
         _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","전체보기","Read more","More"],
                                   per=(6 if FAST_MODE else 10))
         _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"],
@@ -251,7 +246,6 @@ def selenium_get_html(url: str, timeout: int = 14) -> str:
         if "saramin" in host:     _expand_saramin(driver)
         if "jobkorea" in host:    _expand_jobkorea(driver)
 
-        # 스크롤(강도 ↑)
         loops = 5 if FAST_MODE else 8
         for _ in range(loops):
             try:
@@ -260,7 +254,6 @@ def selenium_get_html(url: str, timeout: int = 14) -> str:
                 break
 
         html = driver.page_source or ""
-        # Wanted extra → html에 <p>로 주입(주석 금지)
         if "wanted.co.kr" in host:
             try:
                 txt_next = extract_wanted_from_next_html(html)
@@ -289,7 +282,7 @@ def fetch_all_text_selenium(url: str, timeout: int = 14) -> Tuple[str, Dict, Opt
     return txt, {"source":"selenium","len":len(txt),"url_final":url_n}, html
 
 # -----------------------------------------------------------------------------
-# Meta & rule-based sections (benefits 분리)
+# Meta & rule-based sections (ONLY 3 buckets)
 # -----------------------------------------------------------------------------
 def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
     meta = {"company_name": "", "company_intro": "", "job_title": ""}
@@ -329,32 +322,22 @@ def rule_based_sections(raw_text: str) -> dict:
     hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
     hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
     hdr_pref = re.compile(r"(우대\s*사항|우대|선호|Preferred|Nice\s*to\s*have|Plus)", re.I)
-    hdr_benefit = re.compile(r"(복지|혜택|benefit|welfare|perk)", re.I)
 
-    out = {"responsibilities": [], "qualifications": [], "preferences": [], "benefits": []}
+    out = {"responsibilities": [], "qualifications": [], "preferences": []}
     bucket=None
 
     def push(line,b):
         if line and len(line)>1 and line not in out[b]:
             out[b].append(line[:180])
 
-    benefit_hint_words = [
-        "health","건강검진","복지","혜택","식대","중식","석식","간식","스낵","카페","커피",
-        "자기계발","교육비","도서","휴가","연차","재택","유연근무","보험","연금","웰빙",
-        "택시비","통신비","장비","스톡옵션","성과급","워크라이프","워라밸","사내동아리"
-    ]
-
     for l in lines:
         if hdr_resp.search(l): bucket="responsibilities"; continue
         if hdr_qual.search(l): bucket="qualifications"; continue
         if hdr_pref.search(l): bucket="preferences"; continue
-        if hdr_benefit.search(l): bucket="benefits"; continue
 
         if bucket is None:
             low = l.lower()
-            if any(k in low for k in benefit_hint_words):
-                bucket = "benefits"
-            elif hdr_pref.search(l):
+            if hdr_pref.search(l):
                 bucket = "preferences"
             elif any(k in low for k in ["java","python","spring","kotlin","react","next","kafka","sql","ml","cloud","aws","gcp"]):
                 bucket = "responsibilities"
@@ -362,14 +345,14 @@ def rule_based_sections(raw_text: str) -> dict:
                 continue
         push(l,bucket)
 
-    # 자격 → 우대 이동(복지 키워드 제외)
+    # 자격 → 우대 이동
     kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
     remain=[]
     for q in out["qualifications"]:
         (out["preferences"] if kw_pref.search(q) else remain).append(q)
     out["qualifications"]=remain
 
-    # 마무리 중복 제거
+    # 중복 제거
     for k in out:
         seen=set(); clean=[]
         for s in out[k]:
@@ -380,11 +363,9 @@ def rule_based_sections(raw_text: str) -> dict:
     return out
 
 # -----------------------------------------------------------------------------
-# LLM structure / Q&A / scoring  (benefits 스키마 추가)
+# LLM structure / Q&A / scoring
 # -----------------------------------------------------------------------------
-PROMPT_SYSTEM_STRUCT = ("너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
-                        "입력 텍스트는 광고/UX잔재/복수 직무가 섞여 있을 수 있다. "
-                        "한국어로 간결하고 중복없이 정제하라.")
+PROMPT_SYSTEM_STRUCT = ("너는 채용 공고를 깔끔하게 구조화하는 보조원이다. 한국어로 간결하고 중복없이 정제하라.")
 
 def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dict:
     ctx = clean_text(raw_text, 14000)
@@ -402,16 +383,14 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
         "\"job_title\": str, "
         "\"responsibilities\": [str], "
         "\"qualifications\": [str], "
-        "\"preferences\": [str], "
-        "\"benefits\": [str]"
+        "\"preferences\": [str]"
         "}\n"
-        "- '우대 사항(preferences)'에는 역량/경험/지식 조건만 포함하라.\n"
-        "- 건강검진·식대·스낵바·교육비·도서·휴가/근무제 등 복지/혜택은 반드시 benefits에만 담아라.\n"
+        "- '우대 사항(preferences)'에는 역량/경험/지식 조건만 포함.\n"
         "- 불릿/이모지 제거, 문장 간결화, 중복 제거."
     )}
     try:
         resp = client.chat.completions.create(
-            model=model, temperature=0.2, max_tokens=1000,
+            model=model, temperature=0.2, max_tokens=950,
             response_format={"type": "json_object"},
             messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg]
         )
@@ -420,10 +399,9 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
         data = {"company_name": meta_hint.get("company_name",""),
                 "company_intro": meta_hint.get("company_intro","원문 정제 실패"),
                 "job_title": meta_hint.get("job_title",""),
-                "responsibilities": [], "qualifications": [], "preferences": [], "benefits": [], "error": str(e)}
+                "responsibilities": [], "qualifications": [], "preferences": [], "error": str(e)}
 
-    # 배열 정리
-    for k in ["responsibilities","qualifications","preferences","benefits"]:
+    for k in ["responsibilities","qualifications","preferences"]:
         arr = data.get(k, [])
         if not isinstance(arr, list): arr=[]
         clean_list=[]; seen=set()
@@ -433,7 +411,6 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
                 seen.add(t); clean_list.append(t[:180])
         data[k] = clean_list[:14]
 
-    # 우대 부족시 규칙 보강 (benefits는 손대지 않음)
     if len(data.get("preferences", [])) < 1:
         rb = rule_based_sections(ctx)
         if rb.get("preferences"):
@@ -446,26 +423,17 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
                 (moved if kw_pref.search(q) else remain).append(q)
             data["preferences"]=moved[:14]; data["qualifications"]=remain[:14]
 
-    # LLM 오분류 보정: preferences에 들어간 복지 항목은 benefits로 이동
-    benefit_kw = re.compile(r"(복지|혜택|건강검진|식대|중식|석식|간식|스낵|커피|자기계발|교육비|도서|휴가|연차|재택|유연근무|보험|연금|웰빙|택시비|통신비|장비|스톡옵션|성과급|워라밸|카페|조식)", re.I)
-    moved=[]; remain=[]
-    for q in data.get("preferences", []):
-        (moved if benefit_kw.search(q) else remain).append(q)
-    data["preferences"]=remain[:14]
-    data["benefits"]=list(dict.fromkeys((data.get("benefits", []) or []) + moved))[:14]
-
     for k in ["company_name","company_intro","job_title"]:
         if isinstance(data.get(k), str): data[k]=re.sub(r"\s+"," ", data[k]).strip()
     return data
 
 def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
     t = re.sub(r"\s+"," ", text or "").strip()
-    if not t: return []
-    out, start = [], 0; L=len(t)
+    out=[]; start=0; L=len(t)
     while start < L:
-        end = min(L, start+size); out.append(t[start:end])
+        end=min(L,start+size); out.append(t[start:end])
         if end==L: break
-        start = max(0, end-overlap)
+        start=max(0,end-overlap)
     return out
 
 def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
@@ -490,11 +458,11 @@ def retrieve_resume_chunks(query: str, chunks: List[str], embeds: np.ndarray, k:
 PROMPT_SYSTEM_Q = ("너는 채용담당자다. 회사/직무 맥락과 채용요건, 지원자 이력서를 함께 고려해 "
                    "서로 겹치지 않는 고품질 한국어 면접 질문을 만든다. 수치/지표/기간/규모/리스크/트레이드오프를 섞어라.")
 PROMPT_SYSTEM_DRAFT = ("너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서 요약을 결합해 "
-                       "STAR(상황-과제-행동-성과)로 8~12문장 답변 **초안**을 한국어로 작성한다. "
-                       "가능하면 지표/수치/기간/임팩트를 포함하라.")
+                       "STAR(상황-과제-행동-성과)로 8~12문장 답변 **초안**을 한국어로 작성한다.")
+
+CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
 PROMPT_SYSTEM_SCORE_STRICT = ("너는 매우 엄격한 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
                               "각 기준은 0~20 정수이며 총점은 합계(100)와 일치해야 한다.")
-CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
 
 def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str,
                                           resume_chunks: List[str], resume_embeds: np.ndarray) -> str:
@@ -502,9 +470,8 @@ def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str,
     resume_context = "\n".join([f"- {t[:350]}" for _, t in hits])[:1200]
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {"role":"user","content":(
-        f"[회사/직무/요건]\n{ctx}\n\n"
-        f"[지원자 이력서 요약(발췌)]\n{resume_context}\n\n"
-        f"[요청]\n- 난이도/연차: {level}\n- 중복/유사도 지양\n- 한국어 면접 질문 1개만 한 줄로 출력")}
+        f"[회사/직무/요건]\n{ctx}\n\n[이력서 발췌]\n{resume_context}\n\n"
+        f"[요청]\n- 난이도/연차: {level}\n- 한국어 면접 질문 1개만 한 줄로 출력")}
     try:
         r = client.chat.completions.create(model=model, temperature=0.8, max_tokens=120,
                                            messages=[{"role":"system","content":PROMPT_SYSTEM_Q}, user_msg])
@@ -520,7 +487,7 @@ def llm_draft_answer(clean: Dict, question: str, model: str,
     resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {"role":"user","content":(
-        f"[회사/직무/채용요건]\n{ctx}\n\n[지원자 이력서 발췌]\n{resume_text}\n\n[면접 질문]\n{question}\n\n"
+        f"[회사/직무/채용요건]\n{ctx}\n\n[이력서 발췌]\n{resume_text}\n\n[면접 질문]\n{question}\n\n"
         "위 정보를 근거로 STAR 기반 한국어 답변 **초안**을 작성해줘.")}
     try:
         r = client.chat.completions.create(model=model, temperature=0.5, max_tokens=700,
@@ -535,7 +502,7 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
     resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {"role":"user","content":(
-        f"[회사/직무/채용요건]\n{ctx}\n\n[지원자 이력서 발췌]\n{resume_text}\n\n"
+        f"[회사/직무/채용요건]\n{ctx}\n\n[이력서 발췌]\n{resume_text}\n\n"
         f"[면접 질문]\n{question}\n\n[지원자 답변]\n{answer}\n\n"
         "다음 JSON 스키마로만 한국어 응답:\n"
         "{"
@@ -576,7 +543,7 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
                 "strengths": [],"risks": [],"improvements": [],"revised_answer":"", "error":str(e)}
 
 # -----------------------------------------------------------------------------
-# Company pages / news (캐시 + 동시 처리)
+# Company pages / news
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def _http_get(url: str, timeout: int = 8) -> str:
@@ -688,7 +655,6 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
         if not raw:
             st.error("수집 실패(로그인/동적 렌더링/봇 차단 가능).")
         else:
-            # 동시 처리: LLM 정제 + (홈페이지/뉴스)
             with st.spinner("정제 및 부가정보 수집 중..."):
                 tasks=[]
                 with ThreadPoolExecutor(max_workers=3) as ex:
@@ -711,12 +677,8 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
                 # 규칙 파서 보강
                 if clean:
                     rb = rule_based_sections(raw)
-                    # preferences/benefits이 비어있으면 규칙으로 채우기
                     if not clean.get("preferences") and rb.get("preferences"):
                         clean["preferences"]=rb["preferences"]
-                    if not clean.get("benefits") and rb.get("benefits"):
-                        clean["benefits"]=rb["benefits"]
-
                 st.session_state.clean_struct = clean
                 st.session_state.company_vision = vis
                 st.session_state.company_talent = tal
@@ -724,7 +686,7 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
             st.success("정제 완료!")
 
 # -----------------------------------------------------------------------------
-# UI 2) 회사 요약 (benefits 포함)
+# UI 2) 회사 요약 (3개 컬럼)
 # -----------------------------------------------------------------------------
 st.header("2) 회사 요약")
 clean = st.session_state.clean_struct
@@ -732,7 +694,7 @@ if clean:
     st.markdown(f"**회사명:** {clean.get('company_name','-')}")
     st.markdown(f"**간단한 회사 소개(요약):** {clean.get('company_intro','-')}")
     st.markdown(f"**모집 분야(직무명):** {clean.get('job_title','-')}")
-    c1,c2,c3,c4 = st.columns(4)
+    c1,c2,c3 = st.columns(3)
     with c1:
         st.markdown("**주요 업무**")
         for b in clean.get("responsibilities", []):
@@ -742,21 +704,13 @@ if clean:
         for b in clean.get("qualifications", []):
             st.markdown(f"- {b}")
     with c3:
-        st.markdown("**우대 사항 (경험/역량)**")
+        st.markdown("**우대 사항**")
         prefs = clean.get("preferences", [])
         if prefs:
             for b in prefs:
                 st.markdown(f"- {b}")
         else:
             st.caption("명시된 우대 사항이 없습니다.")
-    with c4:
-        st.markdown("**복지/혜택**")
-        bens = clean.get("benefits", [])
-        if bens:
-            for b in bens:
-                st.markdown(f"- {b}")
-        else:
-            st.caption("복지/혜택 정보가 없습니다.")
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
@@ -979,7 +933,6 @@ st.divider()
 # -----------------------------------------------------------------------------
 st.subheader("팔로업 질문 · 답변 · 피드백")
 
-# 메인 피드백 직후 자동 제안
 if last and not st.session_state.followups:
     try:
         ctx = json.dumps({"company": st.session_state.clean_struct,
