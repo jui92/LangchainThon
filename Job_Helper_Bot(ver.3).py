@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-enabled) : 자소서 생성 / 모의 면접
-# - 정적 수집(requests/bs4) + 선택적 동적 수집(Selenium 헤드리스)
-# - "더보기/상세/우대" 버튼 자동 클릭으로 우대사항까지 수집 강화
+# Job Helper Bot (Selenium-enabled, ordered to avoid NameError)
+# - 자소서 생성 / 모의 면접
+# - Selenium로 '더보기/상세/우대'를 펼쳐 우대사항까지 수집
+# - 정적 수집(requests/bs4, Jina proxy)과 폴백
 ################################################################################
 
-import os, re, json, urllib.parse, time, io, random, tempfile
+import os, re, json, urllib.parse, time, io, tempfile
 from typing import Optional, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -16,17 +17,17 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import html2text
 import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# ===== OpenAI =====
+# ==== OpenAI ====
 try:
     from openai import OpenAI
 except ImportError:
     st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
     st.stop()
 
-# ===== (선택) Selenium =====
+# ==== (선택) Selenium ====
 SELENIUM_AVAILABLE = True
 try:
     from selenium import webdriver
@@ -34,15 +35,20 @@ try:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+    from selenium.common.exceptions import TimeoutException, WebDriverException
     from webdriver_manager.chrome import ChromeDriverManager
 except Exception:
     SELENIUM_AVAILABLE = False
 
-# ===== Streamlit base =====
+# -----------------------------------------------------------------------------
+# Streamlit 기본 설정
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="Job Helper Bot (Selenium)", page_icon="🔎", layout="wide")
 st.title("🔎 Job Helper Bot (Selenium) : 자소서 생성 / 모의 면접")
 
+# -----------------------------------------------------------------------------
+# OpenAI 키 입력/확보
+# -----------------------------------------------------------------------------
 API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
 if not API_KEY:
     API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
@@ -50,18 +56,25 @@ if not API_KEY:
     st.stop()
 client = OpenAI(api_key=API_KEY)
 
-# ===== Sidebar =====
+# -----------------------------------------------------------------------------
+# Sidebar 옵션
+# -----------------------------------------------------------------------------
 with st.sidebar:
     st.subheader("모델 & 옵션")
     CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
-    EMBED_MODEL = st.selectbox("임베딩 모델(내부용)", ["text-embedding-3-small","text-embedding-3-large"], index=0)
+    EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
     ENABLE_COMPANY_ENRICH = st.checkbox("회사 비전/인재상/뉴스 수집", value=True)
-    ENABLE_SELENIUM = st.checkbox("Selenium(동적 수집) 사용", value=True if SELENIUM_AVAILABLE else False,
-                                  help="더보기/상세 버튼을 눌러 우대사항까지 수집")
+    ENABLE_SELENIUM = st.checkbox(
+        "Selenium(동적 수집) 사용",
+        value=True if SELENIUM_AVAILABLE else False,
+        help="‘더보기/상세/우대’ 버튼을 자동 클릭해 전체 본문 수집"
+    )
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 4, 20, 8)
     MAX_FETCH_PARALLEL = st.slider("병렬 수집 쓰레드", 2, 8, 4)
 
-# ===== HTTP session =====
+# -----------------------------------------------------------------------------
+# HTTP 세션 & html2text
+# -----------------------------------------------------------------------------
 def _http_session():
     sess = requests.Session()
     retry = Retry(total=2, backoff_factor=0.3,
@@ -76,7 +89,6 @@ def _http_session():
     return sess
 HTTP = _http_session()
 
-# ===== html2text converter =====
 def _get_html2text():
     conv = html2text.HTML2Text()
     conv.ignore_links = True
@@ -85,7 +97,9 @@ def _get_html2text():
     return conv
 HTML2TEXT = _get_html2text()
 
-# ===== util =====
+# -----------------------------------------------------------------------------
+# 공통 유틸
+# -----------------------------------------------------------------------------
 def normalize_url(u: str) -> Optional[str]:
     if not u: return None
     u = u.strip()
@@ -99,7 +113,6 @@ def clean_text(s: str, max_len: int = 16000) -> str:
     s = re.sub(r"\s+"," ", s).strip()
     return s[:max_len] if len(s) > max_len else s
 
-# ===== basic GET =====
 def http_get(url: str, timeout: int = 8) -> Optional[requests.Response]:
     try:
         r = HTTP.get(url, timeout=timeout)
@@ -109,9 +122,96 @@ def http_get(url: str, timeout: int = 8) -> Optional[requests.Response]:
         pass
     return None
 
-# =============================================================================
-# 1) Selenium 동적 수집
-# =============================================================================
+# -----------------------------------------------------------------------------
+# (1) 회사 비전/인재상/뉴스 수집 함수들  ※ UI에서 호출되므로 여기 ‘위쪽’에 선언
+# -----------------------------------------------------------------------------
+def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
+    out = {"vision": [], "talent": []}
+    base = normalize_url(home_url)
+    if not base: return out
+    paths = ["","/","/about","/company","/about-us","/mission","/vision","/values","/culture","/careers","/talent","/people"]
+    urls, seen = [], set()
+    for p in paths:
+        u = (base.rstrip("/") + p) if p else base
+        if u not in seen:
+            seen.add(u); urls.append(u)
+
+    texts_all=[]
+    with ThreadPoolExecutor(max_workers=MAX_FETCH_PARALLEL) as ex:
+        futs = {ex.submit(HTTP.get, u, 6): u for u in urls}
+        for fu in as_completed(futs):
+            r=None
+            try: r = fu.result()
+            except Exception: pass
+            if not (r and r.status_code==200): continue
+            soup = BeautifulSoup(r.text, "lxml")
+            for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
+                t = tag.get_text(" ", strip=True)
+                if t and 6 <= len(t) <= 260:
+                    texts_all.append(re.sub(r"\s+"," ", t))
+
+    for t in texts_all:
+        low = t.lower()
+        if any(k in low for k in ["talent","인재상","인재","people we","who we hire"]):
+            out["talent"].append(t)
+        if any(k in low for k in ["비전","미션","핵심가치","가치","원칙","mission","vision","values","principle"]):
+            out["vision"].append(t)
+
+    for k in out:
+        out[k] = list(dict.fromkeys(x.strip() for x in out[k]))[:12]
+    return out
+
+def _load_naver_keys():
+    cid = os.getenv("NAVER_CLIENT_ID")
+    csec = os.getenv("NAVER_CLIENT_SECRET")
+    try:
+        if hasattr(st, "secrets"):
+            cid = cid or st.secrets.get("NAVER_CLIENT_ID", None)
+            csec = csec or st.secrets.get("NAVER_CLIENT_SECRET", None)
+    except Exception:
+        pass
+    return cid, csec
+
+def naver_search_news(company: str, display: int = 5) -> List[Dict]:
+    cid, csec = _load_naver_keys()
+    if not (cid and csec): return []
+    url = "https://openapi.naver.com/v1/search/news.json"
+    headers = {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec}
+    try:
+        r = HTTP.get(url, headers=headers, params={"query": company, "display": display, "sort":"date"}, timeout=6)
+        if r.status_code != 200: return []
+        js=r.json()
+        items=[]
+        for it in js.get("items", []):
+            title = re.sub(r"</?b>|&quot;|&apos;|&amp;|&lt;|&gt;", "", it.get("title","")).strip()
+            items.append({"title": title, "link": it.get("link"), "pubDate": it.get("pubDate")})
+        return items
+    except Exception:
+        return []
+
+def google_news_rss(company: str, max_items: int = 5) -> List[Dict]:
+    q = urllib.parse.quote(company)
+    url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+    try:
+        r = HTTP.get(url, timeout=6)
+        if r.status_code != 200: return []
+        soup = BeautifulSoup(r.text, "xml")
+        out=[]
+        for it in soup.find_all("item")[:max_items]:
+            out.append({"title": (it.title.get_text() if it.title else "").strip(),
+                        "link": (it.link.get_text() if it.link else "").strip(),
+                        "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()})
+        return out
+    except Exception:
+        return []
+
+def fetch_latest_news(company: str, max_items: int = 5) -> List[Dict]:
+    items = naver_search_news(company, display=max_items)
+    return items if items else google_news_rss(company, max_items=max_items)
+
+# -----------------------------------------------------------------------------
+# (2) Selenium 동적 수집 (선택)
+# -----------------------------------------------------------------------------
 def _build_chrome(headless: bool = True):
     if not SELENIUM_AVAILABLE:
         raise RuntimeError("Selenium 미설치")
@@ -121,37 +221,26 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1440,2000")
+    opts.add_argument("--window-size=1440,2200")
     opts.add_argument("--lang=ko-KR")
     try:
         driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
     except WebDriverException:
-        # 호환 안될 경우 기본 생성 시도
         driver = webdriver.Chrome(options=opts)
     return driver
 
-def _click_if_present(driver, by, selector, timeout=4):
-    try:
-        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
-        driver.execute_script("arguments[0].click();", el)
-        time.sleep(0.3)
-        return True
-    except Exception:
-        return False
-
 def _click_by_text_candidates(driver, texts: List[str], timeout=4):
-    # 텍스트로 버튼/스팬/링크를 찾아 클릭 (여러 후보 시 순차 시도)
     for t in texts:
         try:
-            # 정확 텍스트/부분 텍스트 모두 시도
+            # 정확/부분 일치 모두 시도
             xpath_exact = f"//*[normalize-space(text())='{t}']"
             xpath_contains = f"//*[contains(normalize-space(text()), '{t}')]"
             for xp in (xpath_exact, xpath_contains):
                 els = driver.find_elements(By.XPATH, xp)
-                for el in els[:6]:  # 너무 많으면 상위 몇 개만
+                for el in els[:8]:
                     try:
                         driver.execute_script("arguments[0].click();", el)
-                        time.sleep(0.3)
+                        time.sleep(0.25)
                         return True
                     except Exception:
                         continue
@@ -160,73 +249,57 @@ def _click_by_text_candidates(driver, texts: List[str], timeout=4):
     return False
 
 def selenium_expand_then_get_html(url: str, timeout: int = 8) -> str:
-    """
-    - 채용 포털에서 '더보기/상세/우대' 등 요소를 클릭해 전체 본문을 펼친 뒤 page_source 반환.
-    - 원티드/사람인/잡코리아 등 공통적으로 쓰이는 텍스트/셀렉터 후보를 여러 개 시도.
-    """
     driver = _build_chrome(headless=True)
     try:
         driver.set_page_load_timeout(timeout)
         driver.get(url)
-        # 초기 로딩 대기 (본문/섹션 등장)
+        # 최소 로딩 대기
         try:
-            WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((By.XPATH, "//*"))
-            )
+            WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, "//*")))
         except TimeoutException:
             pass
 
-        # 1) 공통 토글/더보기 후보들 클릭
-        common_texts = ["더보기", "상세보기", "자세히 보기", "자세히", "전체보기", "펼치기", "모두 보기", "Read more", "More"]
-        _click_by_text_candidates(driver, common_texts, timeout=timeout)
+        # 공통 “더보기/상세/우대” 후보 텍스트 클릭
+        _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","자세히","전체보기","펼치기","모두 보기","Read more","More"], timeout=timeout)
+        _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"], timeout=timeout)
 
-        # 2) 우대/자격/주요업무 섹션 트리거 후보
-        #   - 포털별 DOM이 수시로 바뀌므로 텍스트+클래스/role 후보들을 다 시도
-        section_texts = ["우대", "우대사항", "자격요건", "주요업무", "Responsibilities", "Requirements", "Preferred"]
-        _click_by_text_candidates(driver, section_texts, timeout=timeout)
-
-        # 3) 자주 쓰이는 CSS/ARIA/Role 기반 '더보기' 셀렉터들 시도
-        sel_candidates = [
-            # aria & role
-            "[aria-expanded='false']",
-            "[aria-controls]",
-            "[role='button']",
-            # common classes
+        # 공통 CSS 후보(접힘 토글)
+        candidates = [
+            "[aria-expanded='false']","[aria-controls]","[role='button']",
             ".more, .MoreButton, .btn-more, .btn_more, .fold, .expand, .toggle",
-            # wanted/saramin/jobkorea 가능성
             "button[class*='More'], a[class*='More']",
             "button[class*='fold'], a[class*='fold']",
             "button[class*='toggle'], a[class*='toggle']"
         ]
-        for css in sel_candidates:
+        for css in candidates:
             try:
                 els = driver.find_elements(By.CSS_SELECTOR, css)
                 for el in els[:8]:
                     try:
-                        driver.execute_script("arguments[0].click();", el); time.sleep(0.2)
+                        driver.execute_script("arguments[0].click();", el)
+                        time.sleep(0.2)
                     except Exception:
                         continue
             except Exception:
                 continue
 
-        # 4) 스크롤 다운(지연 로딩 방지)
-        try:
-            for _ in range(4):
-                driver.execute_script("window.scrollBy(0, 800);"); time.sleep(0.2)
-        except Exception:
-            pass
+        # 스크롤 (지연로딩 방지)
+        for _ in range(4):
+            try:
+                driver.execute_script("window.scrollBy(0, 900);"); time.sleep(0.2)
+            except Exception:
+                break
 
-        html = driver.page_source
-        return html
+        return driver.page_source or ""
     except Exception:
         return ""
     finally:
         try: driver.quit()
         except Exception: pass
 
-# =============================================================================
-# 2) 텍스트 추출 (정적/동적 폴백)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# (3) 페이지 텍스트 추출 (Selenium → Jina → requests → BS4)
+# -----------------------------------------------------------------------------
 def html_to_text(html_str: str) -> str:
     txt = HTML2TEXT.handle(html_str or "")
     txt = re.sub(r"\n{3,}", "\n\n", txt)
@@ -237,7 +310,7 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
     if not url:
         return "", {"error":"invalid_url"}, None
 
-    # a) Selenium로 먼저 시도 (옵션 on)
+    # a) Selenium 먼저 (옵션 On)
     if use_selenium and SELENIUM_AVAILABLE:
         try:
             html_dyn = selenium_expand_then_get_html(url, timeout=timeout)
@@ -254,7 +327,6 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
         if parts.query: prox += f"?{parts.query}"
         rj = http_get(prox, timeout=timeout)
         if rj and rj.text:
-            # 원문 HTML 한번만 별도 요청
             base_r = http_get(url, timeout=timeout)
             soup_html = base_r.text if base_r else None
             return clean_text(rj.text), {"source":"jina","len":len(rj.text),"url_final":url}, soup_html
@@ -267,7 +339,7 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
         txt = html_to_text(r.text)
         return txt, {"source":"webbase","len":len(txt),"url_final":url}, r.text
 
-    # d) BS4 fallback (대용량 텍스트)
+    # d) BS4 fallback
     r2 = http_get(url, timeout=timeout)
     if r2:
         soup = BeautifulSoup(r2.text, "lxml")
@@ -282,9 +354,9 @@ def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str,
 
     return "", {"source":"none","len":0,"url_final":url}, None
 
-# =============================================================================
-# 3) 메타/정제/회사정보/임베딩/RAG/LLM (원본 로직 유지)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# (4) 메타/정제/규칙 기반 보완
+# -----------------------------------------------------------------------------
 def extract_company_meta(soup_html: Optional[str]) -> Dict[str,str]:
     meta = {"company_name":"","company_intro":"","job_title":""}
     if not soup_html: return meta
@@ -355,6 +427,7 @@ PROMPT_SYSTEM_STRUCT = (
     "너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
     "입력 텍스트는 잡다한 광고/UI잔재가 섞여 있을 수 있다. 한국어로 간결하고 중복 없이 정제하라."
 )
+
 def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
     ctx = clean_text(raw_text, 14000)
     user_msg = {"role":"user","content":(
@@ -399,6 +472,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
                 seen.add(t); clean.append(t[:180])
         data[k] = clean[:12]
 
+    # 우대가 비어있으면 규칙 기반 보완
     if len(data.get("preferences", [])) < 1:
         rb = rule_based_sections(ctx)
         if rb.get("preferences"):
@@ -415,7 +489,9 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             data[k] = re.sub(r"\s+"," ", data[k]).strip()
     return data
 
-# 파일 리더
+# -----------------------------------------------------------------------------
+# (5) 파일 리더 / 임베딩 / 검색 / LLM 질문·초안·채점
+# -----------------------------------------------------------------------------
 try:
     import pypdf
 except Exception:
@@ -486,7 +562,7 @@ def cosine_topk(matrix_n: np.ndarray, query_vec_n: np.ndarray, k: int = 4):
 def retrieve_resume_chunks(query: str, chunks: List[str], embeds_norm: np.ndarray, k: int = 4):
     if not chunks or embeds_norm is None or embeds_norm.size == 0:
         return []
-    qv = embed_texts([query], st.session_state.EMBED_MODEL)
+    qv = embed_texts([query], EMBED_MODEL)
     qv_n = l2_normalize(qv)
     scores, idxs = cosine_topk(embeds_norm, qv_n, k=k)
     return [(float(s), chunks[int(i)]) for s, i in zip(scores, idxs)]
@@ -606,9 +682,9 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
                 "strengths": [], "risks": [], "improvements": [], "revised_answer": "",
                 "error": str(e)}
 
-# =============================================================================
-# 4) Streamlit UI
-# =============================================================================
+# -----------------------------------------------------------------------------
+# (6) 세션 상태
+# -----------------------------------------------------------------------------
 def _init_state():
     defaults = {
         "clean_struct": None,
@@ -627,14 +703,15 @@ def _init_state():
         "company_home": "",
         "company_vision": [],
         "company_talent": [],
-        "company_news": [],
-        "EMBED_MODEL": EMBED_MODEL
+        "company_news": []
     }
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 _init_state()
 
-# 1) 채용 공고 URL
+# -----------------------------------------------------------------------------
+# (7) UI: 1) 채용 공고 URL 입력 → 원문 수집·정제
+# -----------------------------------------------------------------------------
 st.header("1) 채용 공고 URL")
 url = st.text_input("채용 공고 상세 URL", placeholder="취업 포털 사이트의 URL을 입력하세요.")
 st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력하세요.")
@@ -653,7 +730,7 @@ if st.button("원문 수집 → 정제", type="primary"):
             with st.spinner("LLM으로 정제 중..."):
                 clean = llm_structurize(raw, hint, CHAT_MODEL)
 
-            # 규칙 기반 우대사항 보완(없으면 이동/추출)
+            # 규칙 기반 우대사항 보완
             if not clean.get("preferences"):
                 rb = rule_based_sections(raw)
                 if rb.get("preferences"):
@@ -667,8 +744,9 @@ if st.button("원문 수집 → 정제", type="primary"):
                     vis, tal, news = [], [], []
                     tasks = []
                     with ThreadPoolExecutor(max_workers=3) as ex:
-                        if st.session_state.company_home.strip():
-                            tasks.append(("pages", ex.submit(fetch_company_pages, st.session_state.company_home.strip())))
+                        home = (st.session_state.company_home or "").strip()
+                        if home:
+                            tasks.append(("pages", ex.submit(fetch_company_pages, home)))
                         cname = clean.get("company_name") or hint.get("company_name") or ""
                         if cname:
                             tasks.append(("news", ex.submit(fetch_latest_news, cname, 5)))
@@ -691,7 +769,9 @@ if st.button("원문 수집 → 정제", type="primary"):
                 st.session_state.company_news = []
             st.success("정제 완료!")
 
-# 2) 회사 요약
+# -----------------------------------------------------------------------------
+# (8) UI: 2) 회사 요약 섹션
+# -----------------------------------------------------------------------------
 st.header("2) 회사 요약")
 clean = st.session_state.clean_struct
 if clean:
@@ -715,88 +795,7 @@ if clean:
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
-# 3) 비전/인재상/뉴스
-def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
-    out = {"vision": [], "talent": []}
-    base = normalize_url(home_url)
-    if not base: return out
-    paths = ["","/","/about","/company","/about-us","/mission","/vision","/values","/culture","/careers","/talent","/people"]
-    urls=[]; seen=set()
-    for p in paths:
-        u = (base.rstrip("/") + p) if p else base
-        if u not in seen:
-            seen.add(u); urls.append(u)
-    texts_all=[]
-    with ThreadPoolExecutor(max_workers=MAX_FETCH_PARALLEL) as ex:
-        futs = {ex.submit(HTTP.get, u, 6): u for u in urls}
-        for fu in as_completed(futs):
-            r=None
-            try: r = fu.result()
-            except Exception: pass
-            if not (r and r.status_code==200): continue
-            soup = BeautifulSoup(r.text, "lxml")
-            for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
-                t = tag.get_text(" ", strip=True)
-                if t and 6 <= len(t) <= 260:
-                    texts_all.append(re.sub(r"\s+"," ", t))
-    for t in texts_all:
-        low = t.lower()
-        if any(k in low for k in ["talent","인재상","인재","people we","who we hire"]):
-            out["talent"].append(t)
-        if any(k in low for k in ["비전","미션","핵심가치","가치","원칙","mission","vision","values","principle"]):
-            out["vision"].append(t)
-    for k in out:
-        out[k] = list(dict.fromkeys(x.strip() for x in out[k]))[:12]
-    return out
-
-def _load_naver_keys():
-    cid = os.getenv("NAVER_CLIENT_ID")
-    csec = os.getenv("NAVER_CLIENT_SECRET")
-    try:
-        if hasattr(st, "secrets"):
-            cid = cid or st.secrets.get("NAVER_CLIENT_ID", None)
-            csec = csec or st.secrets.get("NAVER_CLIENT_SECRET", None)
-    except Exception:
-        pass
-    return cid, csec
-
-def naver_search_news(company: str, display: int = 5) -> List[Dict]:
-    cid, csec = _load_naver_keys()
-    if not (cid and csec): return []
-    url = "https://openapi.naver.com/v1/search/news.json"
-    headers = {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec}
-    try:
-        r = HTTP.get(url, headers=headers, params={"query": company, "display": display, "sort":"date"}, timeout=6)
-        if r.status_code != 200: return []
-        js=r.json()
-        items=[]
-        for it in js.get("items", []):
-            title = re.sub(r"</?b>|&quot;|&apos;|&amp;|&lt;|&gt;", "", it.get("title","")).strip()
-            items.append({"title": title, "link": it.get("link"), "pubDate": it.get("pubDate")})
-        return items
-    except Exception:
-        return []
-
-def google_news_rss(company: str, max_items: int = 5) -> List[Dict]:
-    q = urllib.parse.quote(company)
-    url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
-    try:
-        r = HTTP.get(url, timeout=6)
-        if r.status_code != 200: return []
-        soup = BeautifulSoup(r.text, "xml")
-        out=[]
-        for it in soup.find_all("item")[:max_items]:
-            out.append({"title": (it.title.get_text() if it.title else "").strip(),
-                        "link": (it.link.get_text() if it.link else "").strip(),
-                        "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()})
-        return out
-    except Exception:
-        return []
-
-def fetch_latest_news(company: str, max_items: int = 5) -> List[Dict]:
-    items = naver_search_news(company, display=max_items)
-    return items if items else google_news_rss(company, max_items=max_items)
-
+# 회사 비전/인재상/뉴스 표시
 if ENABLE_COMPANY_ENRICH and (st.session_state.company_vision or st.session_state.company_talent or st.session_state.company_news):
     st.divider()
     st.subheader("회사 비전/인재상 & 최신 이슈")
@@ -820,7 +819,9 @@ if ENABLE_COMPANY_ENRICH and (st.session_state.company_vision or st.session_stat
 
 st.divider()
 
-# 4) 이력서 업로드/인덱싱
+# -----------------------------------------------------------------------------
+# (9) UI: 3) 이력서 업로드/인덱싱
+# -----------------------------------------------------------------------------
 st.header("3) 내 이력서/프로젝트 업로드")
 uploads = st.file_uploader("여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True)
 _RESUME_CHUNK = 500; _RESUME_OVLP = 100
@@ -851,7 +852,9 @@ with col_idx[0]:
 
 st.divider()
 
-# 5) 자소서 생성
+# -----------------------------------------------------------------------------
+# (10) UI: 4) 자소서 생성
+# -----------------------------------------------------------------------------
 st.header("4) 이력서 기반 자소서 생성")
 topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
 
@@ -897,7 +900,9 @@ if st.button("자소서 생성", type="primary"):
 
 st.divider()
 
-# 6) 질문 생성 & 답변 초안
+# -----------------------------------------------------------------------------
+# (11) UI: 5) 질문 생성 & 답변 초안
+# -----------------------------------------------------------------------------
 st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
 level  = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
 
@@ -937,9 +942,11 @@ with cols_q[1]:
                 st.error("초안 생성 실패")
 
 st.text_area("질문", value=st.session_state.current_question, height=100)
-ans = st.text_area("나의 답변 (초안을 편집해 완성하세요)", height=200, key="answer_text")
+st.text_area("나의 답변 (초안을 편집해 완성하세요)", height=200, key="answer_text")
 
-# 7) 채점 & 코칭
+# -----------------------------------------------------------------------------
+# (12) UI: 6) 채점 & 코칭
+# -----------------------------------------------------------------------------
 st.header("6) 채점 & 코칭")
 if st.button("채점 & 코칭 실행", type="primary"):
     if not st.session_state.current_question:
@@ -969,7 +976,9 @@ if st.button("채점 & 코칭 실행", type="primary"):
         })
         st.success("채점/코칭 완료!")
 
-# 8) 피드백 결과 & 팔로업
+# -----------------------------------------------------------------------------
+# (13) UI: 7) 피드백 & 팔로업
+# -----------------------------------------------------------------------------
 st.header("7) 피드백 결과")
 last = st.session_state.last_result
 if last:
@@ -996,7 +1005,6 @@ else:
     st.info("아직 채점 결과가 없습니다.")
 
 st.divider()
-
 st.subheader("팔로업 질문 · 답변 · 피드백")
 if last and not st.session_state.followups:
     try:
@@ -1039,7 +1047,6 @@ if last:
                         st.session_state.clean_struct, fu_q, fu_ans, CHAT_MODEL,
                         st.session_state.resume_chunks, st.session_state.resume_embeds_norm
                     )
-                st.session_state.last_followup_result = res_fu
                 st.markdown("**팔로업 결과**")
                 st.metric("총점(/100)", res_fu.get("overall_score", 0))
                 for it in res_fu.get("criteria", []):
