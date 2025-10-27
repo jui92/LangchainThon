@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-enabled, ordered to avoid NameError)
+# Job Helper Bot (Selenium-enabled, domain-tuned, NameError-safe)
 # - 자소서 생성 / 모의 면접
-# - Selenium로 '더보기/상세/우대'를 펼쳐 우대사항까지 수집
-# - 정적 수집(requests/bs4, Jina proxy)과 폴백
+# - Selenium로 '더보기/상세/우대'를 펼쳐 우대사항까지 수집 (강제 사용 옵션 포함)
+# - 정적 수집(requests/bs4, Jina proxy) 폴백
 ################################################################################
 
 import os, re, json, urllib.parse, time, io, tempfile
@@ -35,7 +35,7 @@ try:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
     from webdriver_manager.chrome import ChromeDriverManager
 except Exception:
     SELENIUM_AVAILABLE = False
@@ -69,6 +69,7 @@ with st.sidebar:
         value=True if SELENIUM_AVAILABLE else False,
         help="‘더보기/상세/우대’ 버튼을 자동 클릭해 전체 본문 수집"
     )
+    FORCE_SELENIUM = st.checkbox("Selenium만 사용(폴백 금지)", value=False)  # ★ 추가
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 4, 20, 8)
     MAX_FETCH_PARALLEL = st.slider("병렬 수집 쓰레드", 2, 8, 4)
 
@@ -116,6 +117,7 @@ def clean_text(s: str, max_len: int = 16000) -> str:
 def http_get(url: str, timeout: int = 8) -> Optional[requests.Response]:
     try:
         r = HTTP.get(url, timeout=timeout)
+        # 일반적으로 HTML만 허용
         if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
             return r
     except Exception:
@@ -221,12 +223,21 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1440,2200")
+    opts.add_argument("--window-size=1440,2400")
     opts.add_argument("--lang=ko-KR")
+    # 헤드리스 탐지 회피 (best-effort)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
     try:
         driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
     except WebDriverException:
         driver = webdriver.Chrome(options=opts)
+    # webdriver 특성 숨김 (가능한 환경에서만)
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+    except Exception:
+        pass
     return driver
 
 def _click_by_text_candidates(driver, texts: List[str], timeout=4):
@@ -247,6 +258,51 @@ def _click_by_text_candidates(driver, texts: List[str], timeout=4):
             continue
     return False
 
+def _click_many(driver, css_list, limit_per_selector=8):
+    for css in css_list:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css)
+            for el in els[:limit_per_selector]:
+                try:
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.2)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+def _expand_wanted(driver):
+    # 원티드: 상세 본문/섹션 토글
+    selectors = [
+        "[data-qa='btn-read-more']",
+        "[aria-expanded='false']",
+        "[role='button']",
+        "button[class*='Read'], a[class*='Read']",
+        "button[class*='More'], a[class*='More']",
+    ]
+    _click_many(driver, selectors)
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보"], timeout=4)
+
+def _expand_saramin(driver):
+    # 사람인: 접힘 토글과 더보기
+    selectors = [
+        ".btn_more", ".btnMore", ".btn-detail", ".btn_toggle",
+        "[aria-expanded='false']", "[role='button']",
+        "button[class*='more'], a[class*='more']"
+    ]
+    _click_many(driver, selectors)
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세정보"], timeout=4)
+
+def _expand_jobkorea(driver):
+    # 잡코리아: 본문 접힘 토글 / 더보기
+    selectors = [
+        ".btnFold", ".btnToggleRead", ".btn_more",
+        "[aria-expanded='false']", "[role='button']",
+        "button[class*='More'], a[class*='More']"
+    ]
+    _click_many(driver, selectors)
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"], timeout=4)
+
 def selenium_expand_then_get_html(url: str, timeout: int = 8) -> str:
     driver = _build_chrome(headless=True)
     try:
@@ -257,31 +313,24 @@ def selenium_expand_then_get_html(url: str, timeout: int = 8) -> str:
         except TimeoutException:
             pass
 
+        host = urllib.parse.urlsplit(url).netloc.lower()
+
+        # 공통 클릭
         _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","자세히","전체보기","펼치기","모두 보기","Read more","More"], timeout=timeout)
         _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"], timeout=timeout)
 
-        candidates = [
-            "[aria-expanded='false']","[aria-controls]","[role='button']",
-            ".more, .MoreButton, .btn-more, .btn_more, .fold, .expand, .toggle",
-            "button[class*='More'], a[class*='More']",
-            "button[class*='fold'], a[class*='fold']",
-            "button[class*='toggle'], a[class*='toggle']"
-        ]
-        for css in candidates:
-            try:
-                els = driver.find_elements(By.CSS_SELECTOR, css)
-                for el in els[:8]:
-                    try:
-                        driver.execute_script("arguments[0].click();", el)
-                        time.sleep(0.2)
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+        # 도메인 전용 확장
+        if "wanted.co.kr" in host:
+            _expand_wanted(driver)
+        if "saramin.co.kr" in host or "saramin" in host:
+            _expand_saramin(driver)
+        if "jobkorea.co.kr" in host:
+            _expand_jobkorea(driver)
 
-        for _ in range(4):
+        # 스크롤 다운(지연 로딩 방지)
+        for _ in range(6):
             try:
-                driver.execute_script("window.scrollBy(0, 900);"); time.sleep(0.2)
+                driver.execute_script("window.scrollBy(0, 1000);"); time.sleep(0.25)
             except Exception:
                 break
 
@@ -300,37 +349,48 @@ def html_to_text(html_str: str) -> str:
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return clean_text(txt)
 
-def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8) -> Tuple[str, Dict, Optional[str]]:
+def fetch_all_text(url: str, use_selenium: bool, timeout: int = 8, force_selenium: bool = False) -> Tuple[str, Dict, Optional[str]]:
+    """
+    force_selenium=True 이면, Selenium 실패 시 폴백하지 않고 즉시 실패 메타를 반환.
+    """
     url = normalize_url(url)
     if not url:
         return "", {"error":"invalid_url"}, None
 
+    # a) Selenium 먼저
     if use_selenium and SELENIUM_AVAILABLE:
         try:
             html_dyn = selenium_expand_then_get_html(url, timeout=timeout)
             if html_dyn and len(html_dyn) > 300:
                 txt = html_to_text(html_dyn)
                 return txt, {"source":"selenium","len":len(txt),"url_final":url}, html_dyn
+            elif force_selenium:
+                return "", {"source":"selenium_failed","len":0,"url_final":url}, None
         except Exception:
-            pass
+            if force_selenium:
+                return "", {"source":"selenium_error","len":0,"url_final":url}, None
+            # 폴백 허용이면 계속 진행
 
+    # b) Jina proxy (content-type이 text/plain일 수 있으므로 직접 호출)
     try:
         parts = urllib.parse.urlsplit(url)
         prox = f"https://r.jina.ai/http://{parts.netloc}{parts.path}"
         if parts.query: prox += f"?{parts.query}"
-        rj = http_get(prox, timeout=timeout)
-        if rj and rj.text:
-            base_r = http_get(url, timeout=timeout)
+        rj = HTTP.get(prox, timeout=timeout)  # content-type 제한 없이
+        if rj and rj.status_code == 200 and rj.text:
+            base_r = http_get(url, timeout=timeout)  # 원문 HTML (가능하면)
             soup_html = base_r.text if base_r else None
             return clean_text(rj.text), {"source":"jina","len":len(rj.text),"url_final":url}, soup_html
     except Exception:
         pass
 
+    # c) 일반 GET → html2text
     r = http_get(url, timeout=timeout)
     if r:
         txt = html_to_text(r.text)
         return txt, {"source":"webbase","len":len(txt),"url_final":url}, r.text
 
+    # d) BS4 fallback
     r2 = http_get(url, timeout=timeout)
     if r2:
         soup = BeautifulSoup(r2.text, "lxml")
@@ -711,15 +771,27 @@ if st.button("원문 수집 → 정제", type="primary"):
         st.warning("URL을 입력하세요.")
     else:
         with st.spinner("원문 수집 중..."):
-            raw, meta, soup_html = fetch_all_text(url.strip(), use_selenium=ENABLE_SELENIUM, timeout=SELENIUM_TIMEOUT)
+            raw, meta, soup_html = fetch_all_text(
+                url.strip(),
+                use_selenium=ENABLE_SELENIUM,
+                timeout=SELENIUM_TIMEOUT,
+                force_selenium=FORCE_SELENIUM,   # ★ 강제 사용 옵션 전달
+            )
             hint = extract_company_meta(soup_html)
 
+        # 수집 소스/길이 표시
+        st.caption(f"수집 소스: {meta.get('source')} · 길이: {meta.get('len')}")
+
         if not raw:
-            st.error("원문을 가져오지 못했습니다. (로그인/동적 렌더링/봇 차단 가능)")
+            if meta.get("source") in ("selenium_failed","selenium_error"):
+                st.error("Selenium 수집에 실패했습니다. (Chrome/크로미움 설치, 타임아웃/셀렉터 확인 필요)")
+            else:
+                st.error("원문을 가져오지 못했습니다. (로그인/동적 렌더링/봇 차단 가능)")
         else:
             with st.spinner("LLM으로 정제 중..."):
                 clean = llm_structurize(raw, hint, CHAT_MODEL)
 
+            # 규칙 기반 우대사항 보완
             if not clean.get("preferences"):
                 rb = rule_based_sections(raw)
                 if rb.get("preferences"):
@@ -727,6 +799,14 @@ if st.button("원문 수집 → 정제", type="primary"):
 
             st.session_state.clean_struct = clean
 
+            # 간단 진단: 우대 키워드 등장량
+            try:
+                kw_cnt = sum(1 for x in re.findall(r"[가-힣A-Za-z]+", raw or "") if any(k in x for k in ["우대","우대사항","Preferred"]))
+                st.caption(f"진단: 원문 내 '우대' 키워드 추정 등장 수 ≈ {kw_cnt}")
+            except Exception:
+                pass
+
+            # 회사 비전/인재상/뉴스
             if ENABLE_COMPANY_ENRICH:
                 with st.spinner("회사 비전/인재상/뉴스 수집 중..."):
                     vis, tal, news = [], [], []
@@ -783,6 +863,7 @@ if clean:
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
+# 회사 비전/인재상/뉴스 표시
 if ENABLE_COMPANY_ENRICH and (st.session_state.company_vision or st.session_state.company_talent or st.session_state.company_news):
     st.divider()
     st.subheader("회사 비전/인재상 & 최신 이슈")
