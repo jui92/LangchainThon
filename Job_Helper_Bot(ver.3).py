@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY + Speed-up + Follow-up + Wanted NEXT fix)
+# Job Helper Bot (Selenium-ONLY + NEXT_DATA merge + Speed-up + Benefits split)
 # - 채용 포털 URL + (선택) 기업 홈페이지 URL + 최신 뉴스 → 모의면접/자소서
 # - Selenium 전용 수집(원티드 Next.js __NEXT_DATA__ 병합), 규칙 파서 보강
 # - 속도 개선: Fast 모드, 동시 처리(ThreadPoolExecutor), 캐시(st.cache_data)
-# - 팔로업 질문 · 답변 · 피드백 UI 포함
+# - 팔로업 질문 · 답변 · 피드백 UI
+# - 우대(preferences)와 복지/혜택(benefits) 완전 분리
 ################################################################################
 
 import os, re, io, json, time, shutil, urllib.parse, tempfile, traceback
@@ -62,7 +63,7 @@ with st.sidebar:
     EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 14)
     FAST_MODE = st.toggle("Fast 모드(확장 최소화, 더 빠름)", value=True)
-    st.caption("Fast 모드: 클릭/스크롤 시도 횟수를 줄여 속도를 높입니다(이번 버전은 강도도 상향).")
+    st.caption("Fast 모드: 클릭/스크롤 횟수를 줄여 속도를 높입니다(이번 버전은 강도 상향).")
 
 # -----------------------------------------------------------------------------
 # html2text
@@ -224,7 +225,7 @@ def extract_wanted_from_next_html(html: str) -> str:
         s=_safe(t)
         if len(s)>2 and s not in seen:
             seen.add(s); lines.append(s)
-    return "\n".join(lines[:900])  # 상한 900로 상향
+    return "\n".join(lines[:900])  # 상한 900
 
 # -----------------------------------------------------------------------------
 # Selenium fetch (DOM + NEXT_DATA)
@@ -288,7 +289,7 @@ def fetch_all_text_selenium(url: str, timeout: int = 14) -> Tuple[str, Dict, Opt
     return txt, {"source":"selenium","len":len(txt),"url_final":url_n}, html
 
 # -----------------------------------------------------------------------------
-# Meta & rule-based sections
+# Meta & rule-based sections (benefits 분리)
 # -----------------------------------------------------------------------------
 def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
     meta = {"company_name": "", "company_intro": "", "job_title": ""}
@@ -328,30 +329,47 @@ def rule_based_sections(raw_text: str) -> dict:
     hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
     hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
     hdr_pref = re.compile(r"(우대\s*사항|우대|선호|Preferred|Nice\s*to\s*have|Plus)", re.I)
-    out = {"responsibilities": [], "qualifications": [], "preferences": []}
+    hdr_benefit = re.compile(r"(복지|혜택|benefit|welfare|perk)", re.I)
+
+    out = {"responsibilities": [], "qualifications": [], "preferences": [], "benefits": []}
     bucket=None
 
     def push(line,b):
         if line and len(line)>1 and line not in out[b]:
             out[b].append(line[:180])
 
+    benefit_hint_words = [
+        "health","건강검진","복지","혜택","식대","중식","석식","간식","스낵","카페","커피",
+        "자기계발","교육비","도서","휴가","연차","재택","유연근무","보험","연금","웰빙",
+        "택시비","통신비","장비","스톡옵션","성과급","워크라이프","워라밸","사내동아리"
+    ]
+
     for l in lines:
         if hdr_resp.search(l): bucket="responsibilities"; continue
         if hdr_qual.search(l): bucket="qualifications"; continue
         if hdr_pref.search(l): bucket="preferences"; continue
+        if hdr_benefit.search(l): bucket="benefits"; continue
+
         if bucket is None:
-            if hdr_pref.search(l): bucket="preferences"
-            elif any(k in l.lower() for k in ["java","python","spring","kafka","ml","sql"]):
-                bucket="responsibilities"
-            else: continue
+            low = l.lower()
+            if any(k in low for k in benefit_hint_words):
+                bucket = "benefits"
+            elif hdr_pref.search(l):
+                bucket = "preferences"
+            elif any(k in low for k in ["java","python","spring","kotlin","react","next","kafka","sql","ml","cloud","aws","gcp"]):
+                bucket = "responsibilities"
+            else:
+                continue
         push(l,bucket)
 
+    # 자격 → 우대 이동(복지 키워드 제외)
     kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
     remain=[]
     for q in out["qualifications"]:
         (out["preferences"] if kw_pref.search(q) else remain).append(q)
     out["qualifications"]=remain
 
+    # 마무리 중복 제거
     for k in out:
         seen=set(); clean=[]
         for s in out[k]:
@@ -362,7 +380,7 @@ def rule_based_sections(raw_text: str) -> dict:
     return out
 
 # -----------------------------------------------------------------------------
-# LLM structure / Q&A / scoring
+# LLM structure / Q&A / scoring  (benefits 스키마 추가)
 # -----------------------------------------------------------------------------
 PROMPT_SYSTEM_STRUCT = ("너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
                         "입력 텍스트는 광고/UX잔재/복수 직무가 섞여 있을 수 있다. "
@@ -384,14 +402,16 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
         "\"job_title\": str, "
         "\"responsibilities\": [str], "
         "\"qualifications\": [str], "
-        "\"preferences\": [str]"
+        "\"preferences\": [str], "
+        "\"benefits\": [str]"
         "}\n"
-        "- '우대 사항(preferences)'은 원문 표기가 있는 항목만 담되, 비워두지 않도록 규칙 파서로 보강.\n"
+        "- '우대 사항(preferences)'에는 역량/경험/지식 조건만 포함하라.\n"
+        "- 건강검진·식대·스낵바·교육비·도서·휴가/근무제 등 복지/혜택은 반드시 benefits에만 담아라.\n"
         "- 불릿/이모지 제거, 문장 간결화, 중복 제거."
     )}
     try:
         resp = client.chat.completions.create(
-            model=model, temperature=0.2, max_tokens=900,
+            model=model, temperature=0.2, max_tokens=1000,
             response_format={"type": "json_object"},
             messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg]
         )
@@ -400,10 +420,11 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
         data = {"company_name": meta_hint.get("company_name",""),
                 "company_intro": meta_hint.get("company_intro","원문 정제 실패"),
                 "job_title": meta_hint.get("job_title",""),
-                "responsibilities": [], "qualifications": [], "preferences": [], "error": str(e)}
+                "responsibilities": [], "qualifications": [], "preferences": [], "benefits": [], "error": str(e)}
 
-    for k in ["responsibilities","qualifications","preferences"]:
-        arr = data.get(k, []); 
+    # 배열 정리
+    for k in ["responsibilities","qualifications","preferences","benefits"]:
+        arr = data.get(k, [])
         if not isinstance(arr, list): arr=[]
         clean_list=[]; seen=set()
         for it in arr:
@@ -412,6 +433,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
                 seen.add(t); clean_list.append(t[:180])
         data[k] = clean_list[:14]
 
+    # 우대 부족시 규칙 보강 (benefits는 손대지 않음)
     if len(data.get("preferences", [])) < 1:
         rb = rule_based_sections(ctx)
         if rb.get("preferences"):
@@ -423,6 +445,14 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dic
             for q in data.get("qualifications", []):
                 (moved if kw_pref.search(q) else remain).append(q)
             data["preferences"]=moved[:14]; data["qualifications"]=remain[:14]
+
+    # LLM 오분류 보정: preferences에 들어간 복지 항목은 benefits로 이동
+    benefit_kw = re.compile(r"(복지|혜택|건강검진|식대|중식|석식|간식|스낵|커피|자기계발|교육비|도서|휴가|연차|재택|유연근무|보험|연금|웰빙|택시비|통신비|장비|스톡옵션|성과급|워라밸|카페|조식)", re.I)
+    moved=[]; remain=[]
+    for q in data.get("preferences", []):
+        (moved if benefit_kw.search(q) else remain).append(q)
+    data["preferences"]=remain[:14]
+    data["benefits"]=list(dict.fromkeys((data.get("benefits", []) or []) + moved))[:14]
 
     for k in ["company_name","company_intro","job_title"]:
         if isinstance(data.get(k), str): data[k]=re.sub(r"\s+"," ", data[k]).strip()
@@ -573,8 +603,7 @@ def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
         seen.add(url)
         html = _http_get(url, timeout=6)
         if not html: continue
-        # 회사 페이지는 lxml이 빠름(있으면 사용)
-        soup = BeautifulSoup(html, "lxml") if "lxml" in str(BeautifulSoup).lower() else BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         texts=[]
         for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
             t = tag.get_text(" ", strip=True)
@@ -680,9 +709,14 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
                         except Exception:
                             continue
                 # 규칙 파서 보강
-                if clean and not clean.get("preferences"):
+                if clean:
                     rb = rule_based_sections(raw)
-                    if rb.get("preferences"): clean["preferences"]=rb["preferences"]
+                    # preferences/benefits이 비어있으면 규칙으로 채우기
+                    if not clean.get("preferences") and rb.get("preferences"):
+                        clean["preferences"]=rb["preferences"]
+                    if not clean.get("benefits") and rb.get("benefits"):
+                        clean["benefits"]=rb["benefits"]
+
                 st.session_state.clean_struct = clean
                 st.session_state.company_vision = vis
                 st.session_state.company_talent = tal
@@ -690,7 +724,7 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
             st.success("정제 완료!")
 
 # -----------------------------------------------------------------------------
-# UI 2) 회사 요약
+# UI 2) 회사 요약 (benefits 포함)
 # -----------------------------------------------------------------------------
 st.header("2) 회사 요약")
 clean = st.session_state.clean_struct
@@ -698,7 +732,7 @@ if clean:
     st.markdown(f"**회사명:** {clean.get('company_name','-')}")
     st.markdown(f"**간단한 회사 소개(요약):** {clean.get('company_intro','-')}")
     st.markdown(f"**모집 분야(직무명):** {clean.get('job_title','-')}")
-    c1,c2,c3 = st.columns(3)
+    c1,c2,c3,c4 = st.columns(4)
     with c1:
         st.markdown("**주요 업무**")
         for b in clean.get("responsibilities", []):
@@ -708,13 +742,21 @@ if clean:
         for b in clean.get("qualifications", []):
             st.markdown(f"- {b}")
     with c3:
-        st.markdown("**우대 사항**")
+        st.markdown("**우대 사항 (경험/역량)**")
         prefs = clean.get("preferences", [])
         if prefs:
             for b in prefs:
                 st.markdown(f"- {b}")
         else:
-            st.caption("우대 사항이 명시되지 않았습니다.")
+            st.caption("명시된 우대 사항이 없습니다.")
+    with c4:
+        st.markdown("**복지/혜택**")
+        bens = clean.get("benefits", [])
+        if bens:
+            for b in bens:
+                st.markdown(f"- {b}")
+        else:
+            st.caption("복지/혜택 정보가 없습니다.")
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
@@ -796,7 +838,7 @@ if st.button("이력서 인덱싱", type="secondary"):
 st.divider()
 
 # -----------------------------------------------------------------------------
-# UI 4) 자소서 생성
+# UI 4) 이력서 기반 자소서 생성
 # -----------------------------------------------------------------------------
 st.header("4) 이력서 기반 자소서 생성")
 topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 지원동기 / 협업 경험 / 문제해결 사례 등")
