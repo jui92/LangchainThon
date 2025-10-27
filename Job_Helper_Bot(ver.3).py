@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY)
+# Job Helper Bot (Selenium-ONLY, Service-fixed)
 # - 자소서 생성 / 모의 면접
-# - 오직 Selenium으로만 페이지 로드/클릭/본문 추출 (폴백 없음)
+# - 오직 Selenium으로만 채용 공고를 로드/클릭/추출 (Jina/requests/BS4 폴백 없음)
+# - 크롬/크로미움 바이너리 자동탐지, Service 사용, 친절한 에러 출력
 ################################################################################
 
-import os, re, json, urllib.parse, time, io, tempfile
+import os, re, json, urllib.parse, time, io, tempfile, shutil, traceback
 from typing import Optional, Tuple, Dict, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
 import html2text
@@ -25,13 +25,17 @@ except ImportError:
 # ==== Selenium (필수) ====
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
-import shutil, pathlib
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    HAS_WDM = True
+except Exception:
+    HAS_WDM = False
 
 # -----------------------------------------------------------------------------
 # Streamlit 기본 설정
@@ -56,9 +60,7 @@ with st.sidebar:
     st.subheader("모델 & 옵션")
     CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
     EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
-    ENABLE_COMPANY_ENRICH = st.checkbox("회사 비전/인재상/뉴스 수집(홈페이지만)", value=True)
-    SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 5, 25, 10)
-    MAX_FETCH_PARALLEL = st.slider("병렬 수집 쓰레드", 2, 8, 4)
+    SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 12)
 
 # -----------------------------------------------------------------------------
 # html2text
@@ -93,8 +95,26 @@ def html_to_text(html_str: str) -> str:
     return clean_text(txt)
 
 # -----------------------------------------------------------------------------
-# (1) Selenium 빌더 & 확장 클릭(도메인 최적화 포함)
+# Selenium 빌더 & 확장 클릭(도메인 최적화 포함)
 # -----------------------------------------------------------------------------
+def _find_chrome_binary() -> Optional[str]:
+    candidates = [
+        os.getenv("GOOGLE_CHROME_BIN"),
+        os.getenv("CHROME_BIN"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium-browser"),
+        shutil.which("chromium"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
 def _build_chrome(headless: bool = True):
     opts = ChromeOptions()
     if headless:
@@ -105,31 +125,27 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--window-size=1440,2400")
     opts.add_argument("--lang=ko-KR")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--remote-debugging-port=9222")
 
-    # ▶ 크롬 바이너리 자동 탐지 (Streamlit Cloud/서버 환경 대비)
-    candidates = [
-        os.getenv("GOOGLE_CHROME_BIN"),
-        os.getenv("CHROME_BIN"),
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium-browser"),
-        shutil.which("chromium"),
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-    ]
-    for p in candidates:
-        if p and os.path.exists(p):
-            opts.binary_location = p
-            break
+    binary = _find_chrome_binary()
+    if not binary:
+        raise RuntimeError(
+            "Chrome/Chromium 실행 파일을 찾지 못했습니다.\n"
+            "- 로컬/서버에 chromium 또는 google-chrome을 설치하세요.\n"
+            "- Streamlit Cloud라면 packages.txt에 'chromium\\nchromium-driver\\nfonts-liberation' 추가 후 재배포하세요.\n"
+            "- 또는 CHROME_BIN/GOOGLE_CHROME_BIN 환경변수로 경로를 지정하세요."
+        )
+    opts.binary_location = binary
 
-    # ▶ webdriver-manager + Service 사용 (Selenium 4 권장 방식)
+    # webdriver-manager → 실패 시 Selenium Manager
     try:
-        driver_path = ChromeDriverManager().install()
-        service = Service(driver_path)
-        driver = webdriver.Chrome(service=service, options=opts)
-    except WebDriverException:
-        # 셀레니움 매니저(내장) 시도 — 로컬에 크롬이 있을 때만 작동
+        if HAS_WDM:
+            driver_path = ChromeDriverManager().install()
+            service = Service(driver_path)
+            driver = webdriver.Chrome(service=service, options=opts)
+        else:
+            raise RuntimeError("webdriver-manager 미설치")
+    except Exception:
         driver = webdriver.Chrome(options=opts)
 
     # (가능한 환경에서) 헤드리스 탐지 회피
@@ -140,7 +156,6 @@ def _build_chrome(headless: bool = True):
     except Exception:
         pass
     return driver
-
 
 def _click_by_text_candidates(driver, texts: List[str]):
     for t in texts:
@@ -200,7 +215,7 @@ def _expand_jobkorea(driver):
     _click_many(driver, selectors)
     _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"])
 
-def selenium_only_get_html(url: str, timeout: int = 10) -> str:
+def selenium_only_get_html(url: str, timeout: int = 12) -> str:
     driver = _build_chrome(headless=True)
     try:
         driver.set_page_load_timeout(timeout)
@@ -237,14 +252,19 @@ def selenium_only_get_html(url: str, timeout: int = 10) -> str:
         except Exception: pass
 
 # -----------------------------------------------------------------------------
-# (2) 페이지 텍스트 추출 (Selenium-ONLY)
+# Selenium-ONLY 추출 파이프라인
 # -----------------------------------------------------------------------------
-def fetch_all_text_selenium_only(url: str, timeout: int = 10) -> Tuple[str, Dict, Optional[str]]:
+def fetch_all_text_selenium_only(url: str, timeout: int = 12) -> Tuple[str, Dict, Optional[str]]:
     url = normalize_url(url)
     if not url:
         return "", {"error":"invalid_url"}, None
+    try:
+        html_dyn = selenium_only_get_html(url, timeout=timeout)
+    except Exception as e:
+        st.error(f"Selenium 드라이버 시작/로드 실패: {e}")
+        st.code("".join(traceback.format_exc()))
+        return "", {"source":"selenium_error","len":0,"url_final":url}, None
 
-    html_dyn = selenium_only_get_html(url, timeout=timeout)
     if not html_dyn or len(html_dyn) < 200:
         return "", {"source":"selenium_failed","len":0,"url_final":url}, None
 
@@ -252,7 +272,7 @@ def fetch_all_text_selenium_only(url: str, timeout: int = 10) -> Tuple[str, Dict
     return txt, {"source":"selenium","len":len(txt),"url_final":url}, html_dyn
 
 # -----------------------------------------------------------------------------
-# (3) 메타/정제/규칙 기반 보완
+# 메타/정제/규칙 기반 보완
 # -----------------------------------------------------------------------------
 def extract_company_meta(soup_html: Optional[str]) -> Dict[str,str]:
     meta = {"company_name":"","company_intro":"","job_title":""}
@@ -389,7 +409,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
     return data
 
 # -----------------------------------------------------------------------------
-# (4) 파일/임베딩/RAG (이전과 동일)
+# 파일/임베딩/RAG
 # -----------------------------------------------------------------------------
 try:
     import pypdf
@@ -581,7 +601,7 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
                 "error": str(e)}
 
 # -----------------------------------------------------------------------------
-# (5) 세션 상태
+# 세션 상태
 # -----------------------------------------------------------------------------
 def _init_state():
     defaults = {
@@ -592,12 +612,7 @@ def _init_state():
         "resume_embeds_norm": None,
         "current_question": "",
         "answer_text": "",
-        "records": [],
-        "followups": [],
-        "selected_followup": "",
-        "followup_answer": "",
         "last_result": None,
-        "last_followup_result": None,
         "company_home": "",
     }
     for k, v in defaults.items():
@@ -605,11 +620,11 @@ def _init_state():
 _init_state()
 
 # -----------------------------------------------------------------------------
-# (6) UI: 1) 채용 공고 URL 입력 → (Selenium Only) 원문 수집·정제
+# UI: 1) 채용 공고 URL (Selenium ONLY) → 수집·정제
 # -----------------------------------------------------------------------------
 st.header("1) 채용 공고 URL (Selenium 전용)")
-url = st.text_input("채용 공고 상세 URL", placeholder="취업 포털/기업 채용 페이지 URL을 입력하세요.")
-st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력하세요.")
+url = st.text_input("채용 공고 상세 URL", placeholder="원티드/사람인/잡코리아/기업 채용 페이지 URL")
+st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL")
 
 if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
     if not url.strip():
@@ -621,7 +636,7 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
 
         st.caption(f"수집 소스: {meta.get('source')} · 길이: {meta.get('len')}")
         if not raw:
-            st.error("Selenium 수집에 실패했습니다. (Chrome/Chromium 설치, 타임아웃/셀렉터 확인 필요)")
+            st.error("Selenium 수집에 실패했습니다. 위 에러 로그를 확인하세요.")
         else:
             with st.spinner("LLM으로 정제 중..."):
                 clean = llm_structurize(raw, hint, CHAT_MODEL)
@@ -637,7 +652,7 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
             st.success("정제 완료!")
 
 # -----------------------------------------------------------------------------
-# (7) UI: 2) 회사 요약
+# UI: 2) 회사 요약
 # -----------------------------------------------------------------------------
 st.header("2) 회사 요약")
 clean = st.session_state.clean_struct
@@ -665,8 +680,14 @@ else:
 st.divider()
 
 # -----------------------------------------------------------------------------
-# (8) UI: 3) 이력서 업로드/인덱싱
+# UI: 3) 이력서 업로드/인덱싱
 # -----------------------------------------------------------------------------
+try:
+    import pypdf  # noqa
+    HAVE_PDF = True
+except Exception:
+    HAVE_PDF = False
+
 st.header("3) 내 이력서/프로젝트 업로드")
 uploads = st.file_uploader("여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True)
 _RESUME_CHUNK = 500; _RESUME_OVLP = 100
@@ -696,7 +717,7 @@ if st.button("이력서 인덱싱", type="secondary"):
 st.divider()
 
 # -----------------------------------------------------------------------------
-# (9) UI: 4) 자소서 생성
+# UI: 4) 자소서 생성
 # -----------------------------------------------------------------------------
 st.header("4) 이력서 기반 자소서 생성")
 topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 직무 지원동기 / 협업 경험 / 문제해결 사례 등")
@@ -740,7 +761,7 @@ if st.button("자소서 생성", type="primary"):
 st.divider()
 
 # -----------------------------------------------------------------------------
-# (10) UI: 5) 질문 생성 & 답변 초안
+# UI: 5) 질문 생성 & 답변 초안
 # -----------------------------------------------------------------------------
 st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
 level  = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
@@ -782,7 +803,7 @@ st.text_area("질문", value=st.session_state.current_question, height=100)
 st.text_area("나의 답변 (초안을 편집해 완성하세요)", height=200, key="answer_text")
 
 # -----------------------------------------------------------------------------
-# (11) UI: 6) 채점 & 코칭
+# UI: 6) 채점 & 코칭
 # -----------------------------------------------------------------------------
 st.header("6) 채점 & 코칭")
 if st.button("채점 & 코칭 실행", type="primary"):
