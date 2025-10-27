@@ -1,65 +1,69 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot (Selenium-ONLY, Service-fixed)
-# - 자소서 생성 / 모의 면접
-# - 오직 Selenium으로만 채용 공고를 로드/클릭/추출 (Jina/requests/BS4 폴백 없음)
-# - 크롬/크로미움 바이너리 자동탐지, Service 사용, 친절한 에러 출력
+# Job Helper Bot (Selenium-ONLY, Selenium Manager, no-lxml)
+# - 자소서/질문/채점
+# - 오직 Selenium으로 채용 공고 수집 (폴백 없음)
+# - lxml 미사용 (BeautifulSoup: html.parser)
+# - 드라이버는 Selenium Manager가 자동 관리 (chromium만 설치되어 있으면 됨)
 ################################################################################
 
 import os, re, json, urllib.parse, time, io, tempfile, shutil, traceback
 from typing import Optional, Tuple, Dict, List
 
-from bs4 import BeautifulSoup
-import html2text
 import streamlit as st
 import numpy as np
 import pandas as pd
+import html2text
+from bs4 import BeautifulSoup
 
-# ==== OpenAI ====
+# OpenAI (>=1.43)
 try:
     from openai import OpenAI
 except ImportError:
     st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
     st.stop()
 
-# ==== Selenium (필수) ====
+# Selenium (드라이버는 Selenium Manager가 자동 다운로드)
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException
 
+# (선택) 문서 파서
 try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    HAS_WDM = True
+    import pypdf
 except Exception:
-    HAS_WDM = False
+    pypdf = None
+try:
+    import docx2txt
+except Exception:
+    docx2txt = None
 
 # -----------------------------------------------------------------------------
-# Streamlit 기본 설정
+# Streamlit 기본
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Job Helper Bot (Selenium-ONLY)", page_icon="🔎", layout="wide")
 st.title("🔎 Job Helper Bot (Selenium-ONLY) : 자소서 생성 / 모의 면접")
 
 # -----------------------------------------------------------------------------
-# OpenAI 키 입력/확보
+# OpenAI 키
 # -----------------------------------------------------------------------------
 API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
 if not API_KEY:
-    API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
+    API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password", help="OpenAI API 키가 필요합니다.")
 if not API_KEY:
     st.stop()
 client = OpenAI(api_key=API_KEY)
 
 # -----------------------------------------------------------------------------
-# Sidebar 옵션
+# 사이드바
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.subheader("모델 & 옵션")
-    CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
-    EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
+    CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
+    EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 12)
 
 # -----------------------------------------------------------------------------
@@ -74,7 +78,7 @@ def _get_html2text():
 HTML2TEXT = _get_html2text()
 
 # -----------------------------------------------------------------------------
-# 공통 유틸
+# 유틸
 # -----------------------------------------------------------------------------
 def normalize_url(u: str) -> Optional[str]:
     if not u: return None
@@ -85,8 +89,8 @@ def normalize_url(u: str) -> Optional[str]:
 
 def clean_text(s: str, max_len: int = 16000) -> str:
     if not s: return ""
-    s = re.sub(r"\r","", s)
-    s = re.sub(r"\s+"," ", s).strip()
+    s = re.sub(r"\r", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s[:max_len] if len(s) > max_len else s
 
 def html_to_text(html_str: str) -> str:
@@ -95,22 +99,22 @@ def html_to_text(html_str: str) -> str:
     return clean_text(txt)
 
 # -----------------------------------------------------------------------------
-# Selenium 빌더 & 확장 클릭(도메인 최적화 포함)
+# Selenium 빌더
 # -----------------------------------------------------------------------------
-def _find_chrome_binary() -> Optional[str]:
-    candidates = [
-        os.getenv("GOOGLE_CHROME_BIN"),
+def _pick_chrome_binary() -> Optional[str]:
+    # 패키지 설치로 보통 /usr/bin/chromium 에 존재
+    cands = [
         os.getenv("CHROME_BIN"),
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium-browser"),
+        os.getenv("GOOGLE_CHROME_BIN"),
         shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
     ]
-    for p in candidates:
+    for p in cands:
         if p and os.path.exists(p):
             return p
     return None
@@ -124,39 +128,17 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1440,2400")
     opts.add_argument("--lang=ko-KR")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--remote-debugging-port=9222")
-
-    binary = _find_chrome_binary()
-    if not binary:
-        raise RuntimeError(
-            "Chrome/Chromium 실행 파일을 찾지 못했습니다.\n"
-            "- 로컬/서버에 chromium 또는 google-chrome을 설치하세요.\n"
-            "- Streamlit Cloud라면 packages.txt에 'chromium\\nchromium-driver\\nfonts-liberation' 추가 후 재배포하세요.\n"
-            "- 또는 CHROME_BIN/GOOGLE_CHROME_BIN 환경변수로 경로를 지정하세요."
-        )
-    opts.binary_location = binary
-
-    # webdriver-manager → 실패 시 Selenium Manager
-    try:
-        if HAS_WDM:
-            driver_path = ChromeDriverManager().install()
-            service = Service(driver_path)
-            driver = webdriver.Chrome(service=service, options=opts)
-        else:
-            raise RuntimeError("webdriver-manager 미설치")
-    except Exception:
-        driver = webdriver.Chrome(options=opts)
-
-    # (가능한 환경에서) 헤드리스 탐지 회피
-    try:
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-    except Exception:
-        pass
+    # 바이너리 경로 지정(있으면)
+    binpath = _pick_chrome_binary()
+    if binpath:
+        opts.binary_location = binpath
+    # Selenium Manager 사용 (드라이버 자동관리)
+    driver = webdriver.Chrome(options=opts)
     return driver
 
+# -----------------------------------------------------------------------------
+# 도메인별 확장 클릭
+# -----------------------------------------------------------------------------
 def _click_by_text_candidates(driver, texts: List[str]):
     for t in texts:
         try:
@@ -195,7 +177,7 @@ def _expand_wanted(driver):
         "button[class*='More'], a[class*='More']",
     ]
     _click_many(driver, selectors)
-    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보"])
+    _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "기업정보"])
 
 def _expand_saramin(driver):
     selectors = [
@@ -204,7 +186,7 @@ def _expand_saramin(driver):
         "button[class*='more'], a[class*='more']"
     ]
     _click_many(driver, selectors)
-    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세정보"])
+    _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "기업정보", "상세정보"])
 
 def _expand_jobkorea(driver):
     selectors = [
@@ -213,8 +195,11 @@ def _expand_jobkorea(driver):
         "button[class*='More'], a[class*='More']"
     ]
     _click_many(driver, selectors)
-    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"])
+    _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "기업정보", "상세보기"])
 
+# -----------------------------------------------------------------------------
+# Selenium 전용 페이지 수집
+# -----------------------------------------------------------------------------
 def selenium_only_get_html(url: str, timeout: int = 12) -> str:
     driver = _build_chrome(headless=True)
     try:
@@ -227,9 +212,9 @@ def selenium_only_get_html(url: str, timeout: int = 12) -> str:
 
         host = urllib.parse.urlsplit(url).netloc.lower()
 
-        # 공통 “더보기/우대” 시도
-        _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","자세히","전체보기","펼치기","모두 보기","Read more","More"])
-        _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"])
+        # 공통 확장 시도
+        _click_by_text_candidates(driver, ["더보기", "상세보기", "자세히 보기", "자세히", "전체보기", "펼치기", "모두 보기", "Read more", "More"])
+        _click_by_text_candidates(driver, ["우대", "우대사항", "자격요건", "주요업무", "Requirements", "Responsibilities", "Preferred"])
 
         # 도메인 전용 확장
         if "wanted.co.kr" in host:
@@ -239,7 +224,7 @@ def selenium_only_get_html(url: str, timeout: int = 12) -> str:
         if "jobkorea.co.kr" in host:
             _expand_jobkorea(driver)
 
-        # 지연 로딩 방지 스크롤
+        # 지연로딩 대비 스크롤
         for _ in range(6):
             try:
                 driver.execute_script("window.scrollBy(0, 1000);"); time.sleep(0.25)
@@ -251,48 +236,45 @@ def selenium_only_get_html(url: str, timeout: int = 12) -> str:
         try: driver.quit()
         except Exception: pass
 
-# -----------------------------------------------------------------------------
-# Selenium-ONLY 추출 파이프라인
-# -----------------------------------------------------------------------------
 def fetch_all_text_selenium_only(url: str, timeout: int = 12) -> Tuple[str, Dict, Optional[str]]:
     url = normalize_url(url)
     if not url:
-        return "", {"error":"invalid_url"}, None
+        return "", {"error": "invalid_url"}, None
     try:
         html_dyn = selenium_only_get_html(url, timeout=timeout)
     except Exception as e:
         st.error(f"Selenium 드라이버 시작/로드 실패: {e}")
         st.code("".join(traceback.format_exc()))
-        return "", {"source":"selenium_error","len":0,"url_final":url}, None
+        return "", {"source": "selenium_error", "len": 0, "url_final": url}, None
 
     if not html_dyn or len(html_dyn) < 200:
-        return "", {"source":"selenium_failed","len":0,"url_final":url}, None
+        return "", {"source": "selenium_failed", "len": 0, "url_final": url}, None
 
     txt = html_to_text(html_dyn)
-    return txt, {"source":"selenium","len":len(txt),"url_final":url}, html_dyn
+    return txt, {"source": "selenium", "len": len(txt), "url_final": url}, html_dyn
 
 # -----------------------------------------------------------------------------
-# 메타/정제/규칙 기반 보완
+# 메타/정제/규칙 기반
 # -----------------------------------------------------------------------------
-def extract_company_meta(soup_html: Optional[str]) -> Dict[str,str]:
-    meta = {"company_name":"","company_intro":"","job_title":""}
+def extract_company_meta(soup_html: Optional[str]) -> Dict[str, str]:
+    meta = {"company_name": "", "company_intro": "", "job_title": ""}
     if not soup_html: return meta
     try:
-        soup = BeautifulSoup(soup_html, "html.parser")
-        cand=[]
-        og = soup.find("meta", {"property":"og:site_name"})
+        soup = BeautifulSoup(soup_html, "html.parser")   # lxml 미사용
+        cand = []
+        og = soup.find("meta", {"property": "og:site_name"})
         if og and og.get("content"): cand.append(og["content"])
-        app = soup.find("meta", {"name":"application-name"})
+        app = soup.find("meta", {"name": "application-name"})
         if app and app.get("content"): cand.append(app["content"])
         if soup.title and soup.title.string: cand.append(soup.title.string)
         cand = [re.split(r"[\-\|\·\—]", c)[0].strip() for c in cand if c]
         cand = [c for c in cand if 2 <= len(c) <= 40]
         meta["company_name"] = cand[0] if cand else ""
-        md = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
+        md = soup.find("meta", {"name": "description"}) or soup.find("meta", {"property": "og:description"})
         if md and md.get("content"):
-            meta["company_intro"] = re.sub(r"\s+"," ", md["content"]).strip()[:500]
+            meta["company_intro"] = re.sub(r"\s+", " ", md["content"]).strip()[:500]
         jt = ""
-        ogt = soup.find("meta", {"property":"og:title"})
+        ogt = soup.find("meta", {"property": "og:title"})
         if ogt and ogt.get("content"): jt = ogt["content"]
         if not jt:
             h1 = soup.find("h1")
@@ -300,22 +282,22 @@ def extract_company_meta(soup_html: Optional[str]) -> Dict[str,str]:
         if not jt:
             h2 = soup.find("h2")
             if h2 and h2.get_text(): jt = h2.get_text(strip=True)
-        meta["job_title"] = re.sub(r"\s+"," ", jt).strip()[:120]
+        meta["job_title"] = re.sub(r"\s+", " ", jt).strip()[:120]
     except Exception:
         pass
     return meta
 
 def clean_bullets(arr):
-    clean=[]; seen=set()
+    clean = []; seen = set()
     for it in arr:
-        t = re.sub(r"\s+"," ", str(it)).strip(" -•·▶▪️").strip()
+        t = re.sub(r"\s+", " ", str(it)).strip(" -•·▶▪️").strip()
         if t and t not in seen:
             seen.add(t); clean.append(t[:180])
     return clean[:12]
 
 def rule_based_sections(raw_text: str) -> dict:
     txt = clean_text(raw_text, 16000)
-    lines = [re.sub(r"\s+"," ", l).strip(" -•·▶▪️") for l in txt.split("\n") if l.strip()]
+    lines = [re.sub(r"\s+", " ", l).strip(" -•·▶▪️") for l in txt.split("\n") if l.strip()]
     hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
     hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
     hdr_pref = re.compile(r"(우대\s*사항|우대|선호|Preferred|Nice\s*to\s*have|Plus)", re.I)
@@ -327,22 +309,22 @@ def rule_based_sections(raw_text: str) -> dict:
             out[b].append(line[:180])
 
     for l in lines:
-        if hdr_resp.search(l): bucket="responsibilities"; continue
-        if hdr_qual.search(l): bucket="qualifications"; continue
-        if hdr_pref.search(l): bucket="preferences"; continue
+        if hdr_resp.search(l): bucket = "responsibilities"; continue
+        if hdr_qual.search(l): bucket = "qualifications"; continue
+        if hdr_pref.search(l): bucket = "preferences"; continue
         if bucket is None:
-            if hdr_pref.search(l): bucket="preferences"
+            if hdr_pref.search(l): bucket = "preferences"
             elif any(k in l.lower() for k in ["java","python","spark","airflow","kafka","ml","sql"]):
-                bucket="responsibilities"
+                bucket = "responsibilities"
             else:
                 continue
         push(l, bucket)
 
     kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
-    remain_qual=[]
+    remain_qual = []
     for q in out["qualifications"]:
         (out["preferences"] if kw_pref.search(q) else remain_qual).append(q)
-    out["qualifications"]=remain_qual
+    out["qualifications"] = remain_qual
 
     for k in out:
         out[k] = list(dict.fromkeys([re.sub(r"\s+"," ", s).strip(" -•·▶▪️").strip() for s in out[k]]))[:12]
@@ -353,9 +335,9 @@ PROMPT_SYSTEM_STRUCT = (
     "입력 텍스트는 잡다한 광고/UI잔재가 섞여 있을 수 있다. 한국어로 간결하고 중복 없이 정제하라."
 )
 
-def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
+def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dict:
     ctx = clean_text(raw_text, 14000)
-    user_msg = {"role":"user","content":(
+    user_msg = {"role": "user", "content": (
         "다음 채용 공고 원문을 구조화해줘.\n\n"
         f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
         f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
@@ -377,8 +359,8 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
     try:
         resp = client.chat.completions.create(
             model=model, temperature=0.2, max_tokens=900,
-            response_format={"type":"json_object"},
-            messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg]
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": PROMPT_SYSTEM_STRUCT}, user_msg]
         )
         data = json.loads(resp.choices[0].message.content)
     except Exception as e:
@@ -389,7 +371,7 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
 
     for k in ["responsibilities","qualifications","preferences"]:
         arr = data.get(k, [])
-        if not isinstance(arr, list): arr=[]
+        if not isinstance(arr, list): arr = []
         data[k] = clean_bullets(arr)
 
     if len(data.get("preferences", [])) < 1:
@@ -401,21 +383,17 @@ def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict
             remain=[]; moved=[]
             for q in data.get("qualifications", []):
                 (moved if kw_pref.search(q) else remain).append(q)
-            data["preferences"]=clean_bullets(moved); data["qualifications"]=clean_bullets(remain)
+            data["preferences"] = clean_bullets(moved)
+            data["qualifications"] = clean_bullets(remain)
 
     for k in ["company_name","company_intro","job_title"]:
         if isinstance(data.get(k), str):
-            data[k] = re.sub(r"\s+"," ", data[k]).strip()
+            data[k] = re.sub(r"\s+", " ", data[k]).strip()
     return data
 
 # -----------------------------------------------------------------------------
-# 파일/임베딩/RAG
+# 파일 파서 / RAG
 # -----------------------------------------------------------------------------
-try:
-    import pypdf
-except Exception:
-    pypdf = None
-
 def read_pdf(data: bytes) -> str:
     if pypdf is None: return ""
     try:
@@ -425,8 +403,8 @@ def read_pdf(data: bytes) -> str:
         return ""
 
 def read_docx(data: bytes) -> str:
+    if docx2txt is None: return ""
     try:
-        import docx2txt
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
             tmp.write(data); tmp.flush()
             return docx2txt.process(tmp.name) or ""
@@ -459,7 +437,7 @@ def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
         start = max(0, end-overlap)
     return out
 
-def embed_texts(texts: List[str], client: OpenAI, model_name: str) -> np.ndarray:
+def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
     if not texts: return np.zeros((0, 1536), dtype=np.float32)
     resp = client.embeddings.create(model=model_name, input=texts)
     vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
@@ -477,10 +455,10 @@ def cosine_topk(matrix_n: np.ndarray, query_vec_n: np.ndarray, k: int = 4):
     idx = np.argsort(-sims)[:k]
     return sims[idx], idx
 
-def retrieve_resume_chunks(query: str, chunks: List[str], embeds_norm: np.ndarray, client: OpenAI, model_name: str, k: int = 4):
+def retrieve_resume_chunks(query: str, chunks: List[str], embeds_norm: np.ndarray, k: int = 4):
     if not chunks or embeds_norm is None or embeds_norm.size == 0:
         return []
-    qv = embed_texts([query], client, model_name)
+    qv = embed_texts([query], EMBED_MODEL)
     qv_n = l2_normalize(qv)
     scores, idxs = cosine_topk(embeds_norm, qv_n, k=k)
     return [(float(s), chunks[int(i)]) for s, i in zip(scores, idxs)]
@@ -503,7 +481,7 @@ CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커�
 
 def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str,
                                           resume_chunks: List[str], resume_embeds_norm: np.ndarray) -> str:
-    hits = retrieve_resume_chunks("핵심 프로젝트와 기술 스택 요약", resume_chunks, resume_embeds_norm, client, EMBED_MODEL, k=4)
+    hits = retrieve_resume_chunks("핵심 프로젝트와 기술 스택 요약", resume_chunks, resume_embeds_norm, k=4)
     resume_context = "\n".join([f"- {t[:350]}" for _, t in hits])[:1200]
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {"role":"user","content":(
@@ -526,7 +504,7 @@ def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str,
 
 def llm_draft_answer(clean: Dict, question: str, model: str,
                      resume_chunks: List[str], resume_embeds_norm: np.ndarray) -> str:
-    hits = retrieve_resume_chunks(question, resume_chunks, resume_embeds_norm, client, EMBED_MODEL, k=4)
+    hits = retrieve_resume_chunks(question, resume_chunks, resume_embeds_norm, k=4)
     resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {"role":"user","content":(
@@ -546,7 +524,7 @@ def llm_draft_answer(clean: Dict, question: str, model: str,
 
 def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: str,
                                resume_chunks: List[str], resume_embeds_norm: np.ndarray) -> Dict:
-    hits = retrieve_resume_chunks(question + "\n" + answer[:800], resume_chunks, resume_embeds_norm, client, EMBED_MODEL, k=4)
+    hits = retrieve_resume_chunks(question + "\n" + answer[:800], resume_chunks, resume_embeds_norm, k=4)
     resume_text = "\n".join([f"- {t[:400]}" for _, t in hits])[:1600]
     ctx = json.dumps(clean, ensure_ascii=False)
     user_msg = {"role":"user","content":(
@@ -613,18 +591,16 @@ def _init_state():
         "current_question": "",
         "answer_text": "",
         "last_result": None,
-        "company_home": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 _init_state()
 
 # -----------------------------------------------------------------------------
-# UI: 1) 채용 공고 URL (Selenium ONLY) → 수집·정제
+# UI: 1) 채용 공고 URL → 수집/정제
 # -----------------------------------------------------------------------------
 st.header("1) 채용 공고 URL (Selenium 전용)")
 url = st.text_input("채용 공고 상세 URL", placeholder="원티드/사람인/잡코리아/기업 채용 페이지 URL")
-st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL")
 
 if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
     if not url.strip():
@@ -636,7 +612,7 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
 
         st.caption(f"수집 소스: {meta.get('source')} · 길이: {meta.get('len')}")
         if not raw:
-            st.error("Selenium 수집에 실패했습니다. 위 에러 로그를 확인하세요.")
+            st.error("Selenium 수집에 실패했습니다. 상단 에러 로그를 확인하세요.")
         else:
             with st.spinner("LLM으로 정제 중..."):
                 clean = llm_structurize(raw, hint, CHAT_MODEL)
@@ -682,12 +658,6 @@ st.divider()
 # -----------------------------------------------------------------------------
 # UI: 3) 이력서 업로드/인덱싱
 # -----------------------------------------------------------------------------
-try:
-    import pypdf  # noqa
-    HAVE_PDF = True
-except Exception:
-    HAVE_PDF = False
-
 st.header("3) 내 이력서/프로젝트 업로드")
 uploads = st.file_uploader("여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True)
 _RESUME_CHUNK = 500; _RESUME_OVLP = 100
@@ -706,7 +676,7 @@ if st.button("이력서 인덱싱", type="secondary"):
         else:
             chunks = chunk(resume_text, size=_RESUME_CHUNK, overlap=_RESUME_OVLP)
             with st.spinner("이력서 벡터화 중..."):
-                embeds = embed_texts(chunks, client, EMBED_MODEL)
+                embeds = embed_texts(chunks, EMBED_MODEL)
                 embeds_norm = l2_normalize(embeds)
             st.session_state.resume_raw = resume_text
             st.session_state.resume_chunks = chunks
@@ -764,7 +734,7 @@ st.divider()
 # UI: 5) 질문 생성 & 답변 초안
 # -----------------------------------------------------------------------------
 st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
-level  = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
+level = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
 
 col1, col2 = st.columns(2)
 with col1:
