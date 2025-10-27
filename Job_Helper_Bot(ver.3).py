@@ -278,7 +278,7 @@ def extract_company_meta(soup_html: Optional[str]) -> Dict[str,str]:
     meta = {"company_name":"","company_intro":"","job_title":""}
     if not soup_html: return meta
     try:
-        soup = BeautifulSoup(soup_html, "lxml")
+        soup = BeautifulSoup(soup_html, "html.parser")
         cand=[]
         og = soup.find("meta", {"property":"og:site_name"})
         if og and og.get("content"): cand.append(og["content"])
