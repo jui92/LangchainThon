@@ -4,7 +4,8 @@
 # - 출력 필드: 주요업무 / 자격요건 / 우대사항 (복지/혜택 제거)
 # - Selenium 전용 수집(원티드 __NEXT_DATA__ 병합), 규칙 파서 보강
 # - Fast 모드, 동시 처리(ThreadPoolExecutor), 캐시(st.cache_data)
-# - 회사 홈페이지(비전/인재상), 뉴스(회사명 수동 입력 제거)
+# - 회사 홈페이지(비전/인재상) ← ★ 강화
+# - 뉴스(회사명 수동 입력 제거)
 # - 자소서 생성, 질문/답변/채점/팔로업
 ################################################################################
 
@@ -108,7 +109,7 @@ def _build_chrome(headless: bool = True):
     return driver
 
 # -----------------------------------------------------------------------------
-# Domain expand helpers
+# Domain expand helpers (채용 포털용 확장 버튼들)
 # -----------------------------------------------------------------------------
 def _click_by_text_candidates(driver, texts: List[str], per=12):
     for t in texts:
@@ -527,7 +528,7 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
                 "strengths": [],"risks": [],"improvements": [],"revised_answer":"", "error":str(e)}
 
 # -----------------------------------------------------------------------------
-# Company pages / news
+# Company pages / news  ← ★ 여기부터 기업 홈페이지 수집 강화
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def _http_get(url: str, timeout: int = 8) -> str:
@@ -541,39 +542,148 @@ def _http_get(url: str, timeout: int = 8) -> str:
         pass
     return ""
 
+# JSON-LD/메타에서 설명 문장 후보 뽑기
+def _parse_jsonld_and_meta(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    out=[]
+    desc = (soup.select_one("meta[name='description']") or {}).get("content")
+    if desc: out.append(desc)
+    ogd  = (soup.select_one("meta[property='og:description']") or {}).get("content")
+    ogt  = (soup.select_one("meta[property='og:title']") or {}).get("content")
+    for x in (ogt, ogd):
+        if x and x not in out: out.append(x)
+    for tag in soup.select("script[type='application/ld+json']"):
+        try:
+            data = json.loads(tag.text)
+        except Exception:
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict): continue
+            t = str(node.get("@type","")).lower()
+            if t in ("organization","website","jobposting","webpage","aboutpage"):
+                for k in ("description","mission","value","headline","about","name"):
+                    v = node.get(k)
+                    if isinstance(v,str) and 6 <= len(v) <= 260:
+                        out.append(v)
+    # dedup
+    uniq,s=[],set()
+    for x in out:
+        if x not in s:
+            s.add(x); uniq.append(x)
+    return uniq
+
+# 홈에서 내비게이션 링크(About/비전/인재상/채용/ESG 등) 후보 수집
+VISION_KEYS = [
+    "비전","미션","핵심가치","가치","원칙","철학",
+    "purpose","mission","vision","values","principle","philosophy",
+    "culture","esg","sustainability","about","company"
+]
+TALENT_KEYS = [
+    "인재","인재상","people","talent","who we hire",
+    "what we look for","team","careers","recruit","채용"
+]
+
+def _collect_nav_links(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    cands=[]
+    for a in soup.find_all("a", href=True):
+        txt  = (a.get_text(" ", strip=True) or "").lower()
+        href = a["href"].strip()
+        hlow = href.lower()
+        if any(k in txt for k in [k.lower() for k in VISION_KEYS + TALENT_KEYS]) or \
+           any(k in hlow for k in [
+               "about","company","mission","vision","values","culture",
+               "people","talent","careers","recruit","esg","sustainability",
+               "/kr","/ko","/ko-kr"
+           ]):
+            cands.append(urllib.parse.urljoin(base_url, href))
+    uniq,s=[],set()
+    for u in cands:
+        if u not in s:
+            s.add(u); uniq.append(u)
+    return uniq[:15]
+
+# 본문에서 문장 추출
+def _extract_texts(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    texts=[]
+    for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
+        t = tag.get_text(" ", strip=True)
+        if not t: continue
+        t = re.sub(r"\s+"," ", t)
+        if 6 <= len(t) <= 260:
+            texts.append(t)
+    return texts
+
+# ★ 강화된 기업 홈페이지 수집기: 정적→동적 폴백 + 홈→내비(깊이1)
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
     out = {"vision": [], "talent": []}
     base = normalize_url(home_url or "")
     if not base: return out
-    paths = ["","/","/about","/company","/about-us","/mission","/vision","/values","/culture","/careers","/talent","/people"]
-    seen=set()
-    for p in paths:
-        url = (base.rstrip("/") + p) if p else base
-        if url in seen: continue
-        seen.add(url)
-        html = _http_get(url, timeout=6)
-        if not html: continue
-        soup = BeautifulSoup(html, "lxml")
-        texts=[]
-        for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
-            t = tag.get_text(" ", strip=True)
-            if not t: continue
-            t = re.sub(r"\s+"," ", t)
-            if 6 <= len(t) <= 260: texts.append(t)
+
+    # 시작 후보(언어/대표 경로 포함)
+    roots = [base.rstrip("/")]
+    for loc in ("/kr","/ko","/ko-kr"):
+        roots.append(base.rstrip("/") + loc)
+    for p in ("/about","/company","/about-us","/mission","/vision","/values",
+              "/culture","/careers","/talent","/people","/esg","/sustainability",
+              "/kr/about","/ko/about"):
+        roots.append(base.rstrip("/") + p)
+
+    visited=set()
+    queue = [(u,0) for u in roots]
+    MAX_DEPTH = 1
+
+    def classify_add(texts: List[str]):
         for t in texts:
-            low=t.lower()
-            if any(k in low for k in ["talent","인재상","who we hire","people we"]):
+            low = t.lower()
+            if any(k in low for k in [k.lower() for k in TALENT_KEYS]):
                 out["talent"].append(t)
-            if any(k in low for k in ["비전","미션","핵심가치","가치","원칙","mission","vision","values","principle"]):
+            if any(k in low for k in [k.lower() for k in VISION_KEYS]):
                 out["vision"].append(t)
+
+    while queue:
+        url, depth = queue.pop(0)
+        if url in visited: continue
+        visited.add(url)
+
+        # 1) 정적
+        html = _http_get(url, timeout=8)
+
+        # 2) 부족/동적 페이지면 Selenium 폴백(있을 때만)
+        if (not html or len(html) < 1200):
+            try:
+                html_dyn = selenium_get_html(url, timeout=SELENIUM_TIMEOUT)
+                if html_dyn and len(html_dyn) >= 100:
+                    html = html_dyn
+            except Exception:
+                pass
+
+        if not html:
+            continue
+
+        # 본문 + JSON-LD/메타에서 후보 문장 취합
+        classify_add(_extract_texts(html))
+        classify_add(_parse_jsonld_and_meta(html))
+
+        # 홈/대표 경로에서는 내비 링크 깊이 1까지 탐색
+        if depth < MAX_DEPTH and url in roots:
+            for nxt in _collect_nav_links(html, url):
+                if nxt not in visited:
+                    queue.append((nxt, depth+1))
+
+    # 후처리: 중복/길이 제한
     for k in out:
         uniq=[]; s=set()
         for x in out[k]:
-            x=x.strip()
-            if x and x not in s:
-                s.add(x); uniq.append(x[:200])
-        out[k]=uniq[:12]
+            x = x.strip()
+            if not x: continue
+            if x in s: continue
+            s.add(x)
+            uniq.append(x[:200])
+        out[k] = uniq[:30]
     return out
 
 @st.cache_data(show_spinner=False, ttl=1200)
@@ -651,7 +761,6 @@ if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
                         domain_fallback = urllib.parse.urlsplit(job_url).netloc.split(":")[0].split(".")[0]
                     except Exception:
                         pass
-                    # clean은 아직 future라서 일단 hint/도메인으로 1차 호출
                     tasks.append(("news", ex.submit(google_news_rss, (hint.get("company_name","") or domain_fallback), 5)))
 
                     clean=None; vis=[]; tal=[]; news=[]
@@ -715,7 +824,7 @@ else:
     st.info("먼저 URL을 정제해 주세요.")
 
 # -----------------------------------------------------------------------------
-# UI 2.5) 회사 비전/인재상 & 최신 이슈  (항상 렌더)
+# UI 2.5) 회사 비전/인재상 & 최신 이슈
 # -----------------------------------------------------------------------------
 st.divider()
 st.subheader("회사 비전/인재상 & 최신 이슈")
@@ -853,7 +962,7 @@ if st.button("자소서 생성", type="primary"):
 st.divider()
 
 # -----------------------------------------------------------------------------
-# UI 5) 질문 생성 & 답변 초안
+# UI 5) 질문 생성 & 답변 초안 (RAG 결합)
 # -----------------------------------------------------------------------------
 st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
 level = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
