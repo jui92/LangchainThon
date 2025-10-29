@@ -102,13 +102,11 @@ except Exception:
     st.stop()
 
 def _pick_chrome_binary() -> Optional[str]:
-    cands = [
-        os.getenv("CHROME_BIN"), os.getenv("GOOGLE_CHROME_BIN"),
-        shutil.which("chromium"), shutil.which("chromium-browser"),
-        shutil.which("google-chrome"),
-        "/usr/bin/chromium","/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome","/usr/bin/google-chrome-stable",
-    ]
+    cands = [os.getenv("CHROME_BIN"), os.getenv("GOOGLE_CHROME_BIN"),
+             shutil.which("chromium"), shutil.which("chromium-browser"),
+             shutil.which("google-chrome"),
+             "/usr/bin/chromium","/usr/bin/chromium-browser",
+             "/usr/bin/google-chrome","/usr/bin/google-chrome-stable",]
     for p in cands:
         if p and os.path.exists(p): return p
     return None
@@ -158,10 +156,8 @@ def click_more_generic(driver):
 
 def expand_portal_specific(driver, host: str):
     if "wanted.co.kr" in host:
-        sels = [
-            "[data-qa='btn-read-more']","[data-qa='job-header__more']",
-            "button[aria-expanded='false']","[role='button'][class*='More']",
-        ]
+        sels = ["[data-qa='btn-read-more']","[data-qa='job-header__more']",
+                "button[aria-expanded='false']","[role='button'][class*='More']",]
     elif "saramin" in host:
         sels = [".btn_more",".btnMore",".btn-detail",".btn_toggle","button[class*='more'], a[class*='more']"]
     elif "jobkorea" in host:
@@ -364,16 +360,12 @@ def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
     return meta
 
 # ============ 회사 홈페이지(정적+동적 폴백) =================
-VISION_KEYS = [
-    "비전","미션","핵심가치","가치","철학","원칙","소개","연혁","문화",
-    "purpose","mission","vision","values","value","principle","philosophy",
-    "culture","esg","sustainability","about","company","who we are","what we do",
-    "our story","brand","story"
-]
-TALENT_KEYS = [
-    "인재","인재상","채용철학","인사제도","복리후생","people","talent",
-    "who we hire","what we look for","team","careers","recruit","채용"
-]
+VISION_KEYS = ["비전","미션","핵심가치","가치","철학","원칙","소개","연혁","문화",
+               "purpose","mission","vision","values","value","principle","philosophy",
+               "culture","esg","sustainability","about","company","who we are","what we do",
+               "our story","brand","story"]
+TALENT_KEYS = ["인재","인재상","채용철학","인사제도","복리후생","people","talent",
+               "who we hire","what we look for","team","careers","recruit","채용"]
 PORTAL_DOMAINS = {"wanted.co.kr","saramin.co.kr","jobkorea.co.kr","linkedin.com","kr.indeed.com","rocketpunch.com"}
 DEFAULT_TIMEOUT = 10
 MAX_PAGES_DEFAULT = 14
@@ -444,11 +436,9 @@ def collect_nav_links(html: str, base_url: str) -> List[str]:
         href = a["href"].strip()
         hlow = href.lower()
         if any(k in txt for k in [k.lower() for k in VISION_KEYS + TALENT_KEYS]) or \
-           any(k in hlow for k in [
-               "about","company","mission","vision","values","culture",
-               "people","talent","careers","recruit","esg","sustainability",
-               "/kr","/ko","/ko-kr","who-we-are","what-we-do","our-story","brand"
-           ]):
+           any(k in hlow for k in ["about","company","mission","vision","values","culture","people",
+                                   "talent","careers","recruit","esg","sustainability",
+                                   "/kr","/ko","/ko-kr","who-we-are","what-we-do","our-story","brand"]):
             cands.append(urllib.parse.urljoin(base_url, href))
     uniq=set(); out=[]
     for u in cands:
@@ -680,14 +670,9 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
 
 # ======================= 상태 =============================
 def _init_state():
-    defaults = dict(
-        clean=None, last_html=None,
-        company_vision=[], company_talent=[], company_news=[],
-        auto_home_used="",
-        resume_chunks=[], resume_embeds=None, resume_raw="",
-        current_question="", answer_text="", last_result=None,
-        followups=[], selected_followup="", followup_answer="",
-    )
+    defaults = dict(clean=None, last_html=None, company_vision=[], company_talent=[], company_news=[],
+                    auto_home_used="", resume_chunks=[], resume_embeds=None, resume_raw="", current_question="", 
+                    answer_text="", last_result=None, followups=[], selected_followup="", followup_answer="",)
     for k,v in defaults.items():
         if k not in st.session_state: st.session_state[k]=v
 _init_state()
