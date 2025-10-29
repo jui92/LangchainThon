@@ -9,26 +9,12 @@ import requests
 import html2text
 from bs4 import BeautifulSoup
 
-# =============================================================================
-# 1. 의존성 및 초기 설정
-# =============================================================================
-
 # OpenAI
 try:
     from openai import OpenAI
 except ImportError:
     st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
     st.stop()
-
-# (선택) 문서 파서
-try:
-    import pypdf
-except Exception:
-    pypdf = None
-try:
-    import docx2txt
-except Exception:
-    docx2txt = None
 
 API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
 if not API_KEY:
@@ -58,7 +44,7 @@ HTML2TEXT = _get_html2text()
 def html_to_text(html_str: str) -> str:
     txt = HTML2TEXT.handle(html_str or "")
     txt = re.sub(r"\n{3,}", "\n\n", txt)
-    return re.sub(r"\s+", " ", txt).strip()
+    return re.re.sub(r"\s+", " ", txt).strip()
 
 # -----------------------------------------------------------------------------
 # Utils
@@ -76,9 +62,9 @@ def clean_text(s: str, max_len: int = 16000) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:max_len] if len(s) > max_len else s
 
-# =============================================================================
-# 2. Selenium Driver/Crawler
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Selenium driver
+# -----------------------------------------------------------------------------
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
@@ -87,7 +73,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 def _pick_chrome_binary() -> Optional[str]:
-    # 환경 변수 및 공통 경로에서 Chrome 바이너리 경로 탐색
     cands = [
         os.getenv("CHROME_BIN"), os.getenv("GOOGLE_CHROME_BIN"),
         shutil.which("chromium"), shutil.which("chromium-browser"),
@@ -109,11 +94,11 @@ def _build_chrome(headless: bool = True):
     opts.add_argument("--lang=ko-KR")
     binpath = _pick_chrome_binary()
     if binpath: opts.binary_location = binpath
-    driver = webdriver.Chrome(options=opts)  # Selenium Manager 자동 사용
+    driver = webdriver.Chrome(options=opts)  # Selenium Manager
     return driver
 
 # -----------------------------------------------------------------------------
-# Domain expand helpers
+# Domain expand helpers (채용 포털용 확장 버튼들)
 # -----------------------------------------------------------------------------
 def _click_by_text_candidates(driver, texts: List[str], per=12):
     for t in texts:
@@ -269,10 +254,6 @@ def fetch_all_text_selenium(url: str, timeout: int = 14) -> Tuple[str, Dict, Opt
         return "", {"source":"selenium_failed","len":0,"url_final":url_n}, None
     txt = html_to_text(html)
     return txt, {"source":"selenium","len":len(txt),"url_final":url_n}, html
-
-# =============================================================================
-# 3. 데이터 파싱 및 정제
-# =============================================================================
 
 # -----------------------------------------------------------------------------
 # Meta & rule-based sections (ONLY 3 buckets)
@@ -535,9 +516,9 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
         return {"overall_score":0,"criteria":[{"name":n,"score":0,"comment":""} for n in CRITERIA],
                 "strengths": [],"risks": [],"improvements": [],"revised_answer":"", "error":str(e)}
 
-# =============================================================================
-# 4. 회사 페이지 / 뉴스 크롤링
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Company pages / news  ← ★ 여기부터 기업 홈페이지 수집 강화
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def _http_get(url: str, timeout: int = 8) -> str:
     try:
@@ -612,15 +593,18 @@ def _collect_nav_links(html: str, base_url: str) -> List[str]:
             s.add(u); uniq.append(u)
     return uniq[:15]
 
-# 본문에서 문장 추출
+# 본문에서 문장 추출 (수정된 부분: div 태그 추가 및 긴 div 내용 제외)
 def _extract_texts(html: str) -> List[str]:
     soup = BeautifulSoup(html or "", "lxml")
     texts=[]
-    for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
+    # 제목 태그와 주요 텍스트 블록 태그 태그 (div도 추가)
+    for tag in soup.find_all(["h1","h2","h3","h4","p","li","div"]):
         t = tag.get_text(" ", strip=True)
         if not t: continue
         t = re.sub(r"\s+"," ", t)
-        if 6 <= len(t) <= 260:
+        # 너무 긴 문장이나 너무 짧은 문장 제외, div 태그는 너무 길면 제외
+        is_long_div = (tag.name == "div" and len(t) > 400)
+        if 6 <= len(t) <= 260 and not is_long_div:
             texts.append(t)
     return texts
 
@@ -660,11 +644,16 @@ def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
         # 1) 정적
         html = _http_get(url, timeout=8)
 
-        # 2) 부족/동적 페이지면 Selenium 폴백(있을 때만)
-        if (not html or len(html) < 1200):
+        # 2) 부족/동적 페이지면 Selenium 폴백(있을 때만) (수정된 부분: 비전/인재상 키워드가 없으면 동적 폴백 시도)
+        is_static_fail = (not html or len(html) < 1200)
+        # HTML을 텍스트로 변환 후, 비전/인재상 키워드가 없는 경우에도 동적 폴백 시도
+        is_vision_missing = not any(k in HTML2TEXT.handle(html or "").lower() for k in VISION_KEYS + TALENT_KEYS)
+
+        if is_static_fail or is_vision_missing:
             try:
                 html_dyn = selenium_get_html(url, timeout=SELENIUM_TIMEOUT)
-                if html_dyn and len(html_dyn) >= 100:
+                # 정적 수집된 것보다 더 많은 내용을 가져왔을 때만 교체
+                if html_dyn and len(html_dyn) > len(html or ""):
                     html = html_dyn
             except Exception:
                 pass
@@ -676,7 +665,7 @@ def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
         classify_add(_extract_texts(html))
         classify_add(_parse_jsonld_and_meta(html))
 
-        # 홈/대표 경로에서는 내비 링크 깊이 깊이 1까지 탐색
+        # 홈/대표 경로에서는 내비 링크 깊이 1까지 탐색
         if depth < MAX_DEPTH and url in roots:
             for nxt in _collect_nav_links(html, url):
                 if nxt not in visited:
@@ -712,11 +701,10 @@ def google_news_rss(company: str, max_items: int = 5) -> List[Dict]:
     except Exception:
         return []
 
-# =============================================================================
-# 5. Streamlit 세션 상태 초기화
-# =============================================================================
-def init_session_state():
-    # 코드 구조의 명확성을 위해 상태 초기화 로직을 분리
+# -----------------------------------------------------------------------------
+# State
+# -----------------------------------------------------------------------------
+def _init_state():
     defaults = {
         "clean_struct": None,
         "resume_raw": "",
@@ -736,11 +724,7 @@ def init_session_state():
     }
     for k,v in defaults.items():
         if k not in st.session_state: st.session_state[k]=v
-init_session_state()
-
-# =============================================================================
-# 6. Streamlit UI (Main)
-# =============================================================================
+_init_state()
 
 # -----------------------------------------------------------------------------
 # UI 1) 채용 공고 URL + (선택) 기업 홈페이지 URL
@@ -875,19 +859,25 @@ st.header("3) 내 이력서/프로젝트 업로드")
 uploads = st.file_uploader("여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True)
 _RESUME_CHUNK=500; _RESUME_OVLP=100
 
-# **[수정]** 의존성 누락 시 사용자에게 명시적으로 안내
-if pypdf is None: st.caption("PDF 파일 파싱을 위해 `pypdf` 패키지 설치가 필요합니다.")
-if docx2txt is None: st.caption("DOCX 파일 파싱을 위해 `docx2txt` 패키지 설치가 필요합니다.")
+# (선택) 문서 파서
+try:
+    import pypdf
+except Exception:
+    pypdf = None
+try:
+    import docx2txt
+except Exception:
+    docx2txt = None
 
 def read_pdf(data: bytes) -> str:
-    if pypdf is None: return "PDF 파서(`pypdf`)를 설치해야 합니다."
+    if pypdf is None: return ""
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
         return "\n\n".join([(reader.pages[i].extract_text() or "") for i in range(len(reader.pages))])
     except Exception: return ""
 
 def read_docx_file(data: bytes) -> str:
-    if docx2txt is None: return "DOCX 파서(`docx2txt`)를 설치해야 합니다."
+    if docx2txt is None: return ""
     try:
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
             tmp.write(data); tmp.flush()
@@ -909,19 +899,9 @@ if st.button("이력서 인덱싱", type="secondary"):
     if not uploads: st.warning("파일을 업로드하세요.")
     else:
         all_text=[]
-        error_found = False
         for up in uploads:
             t = read_file_text(up)
-            # **[수정]** 파서 누락 시 에러 처리
-            if t.startswith("PDF 파서") or t.startswith("DOCX 파서"):
-                 st.error(t)
-                 error_found = True
-                 continue
             if t: all_text.append(t)
-        
-        if error_found: # 에러가 발생했으면 인덱싱 중단
-            st.warning("일부 파일의 텍스트 추출을 건너뛰었습니다. 필요한 파서를 설치해주세요.")
-        
         resume_text = "\n\n".join(all_text)
         if not resume_text.strip(): st.error("텍스트 추출 실패")
         else:
@@ -989,8 +969,6 @@ with c1:
     if st.button("새 질문 받기", type="primary"):
         if not st.session_state.clean_struct:
             st.warning("먼저 회사 URL을 정제하세요.")
-        elif not st.session_state.resume_embeds is not None:
-             st.warning("면접 질문은 이력서 기반으로 생성됩니다. 이력서 인덱싱을 완료해주세요.")
         else:
             q = llm_generate_one_question_with_resume(
                 st.session_state.clean_struct, level, CHAT_MODEL,
@@ -1010,8 +988,6 @@ with c2:
     if st.button("RAG로 답변 초안 생성", type="secondary"):
         if not st.session_state.current_question:
             st.warning("먼저 질문을 생성하세요.")
-        elif not st.session_state.resume_embeds is not None:
-             st.warning("RAG 답변은 이력서 기반으로 생성됩니다. 이력서 인덱싱을 완료해주세요.")
         else:
             draft = llm_draft_answer(
                 st.session_state.clean_struct, st.session_state.current_question, CHAT_MODEL,
@@ -1035,8 +1011,6 @@ if st.button("채점 & 코칭 실행", type="primary"):
         st.warning("먼저 질문을 생성하세요.")
     elif not st.session_state.answer_text.strip():
         st.warning("답변을 작성해 주세요.")
-    elif not st.session_state.resume_embeds is not None:
-        st.warning("채점은 이력서 내용과의 정합성 검토를 포함합니다. 이력서 인덱싱을 완료해주세요.")
     else:
         with st.spinner("채점/코칭 중..."):
             res = llm_score_and_coach_strict(
