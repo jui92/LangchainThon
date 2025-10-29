@@ -1,24 +1,34 @@
-# -*- coding: utf-8 -*-
-################################################################################
-# Job Helper Bot - Dynamic Crawl Edition (Selenium-first, Company Home Booster)
-# by Jui & ChatGPT
-################################################################################
-import os, re, io, json, time, shutil, tempfile, traceback, urllib.parse
-from typing import List, Dict, Tuple, Optional
-from collections import Counter
+import os, re, io, json, time, shutil, urllib.parse, tempfile, traceback
+from typing import Optional, Tuple, Dict, List
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 import numpy as np
+import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 import html2text
+from bs4 import BeautifulSoup
 
-# ======================= OpenAI ===========================
+# =============================================================================
+# 1. 의존성 및 초기 설정
+# =============================================================================
+
+# OpenAI
 try:
     from openai import OpenAI
 except ImportError:
-    st.error("pip install openai 로 설치 후 다시 실행하세요.")
+    st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
     st.stop()
+
+# (선택) 문서 파서
+try:
+    import pypdf
+except Exception:
+    pypdf = None
+try:
+    import docx2txt
+except Exception:
+    docx2txt = None
 
 API_KEY = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
 if not API_KEY:
@@ -27,35 +37,32 @@ if not API_KEY:
     st.stop()
 client = OpenAI(api_key=API_KEY)
 
-# ======================= UI Options =======================
 with st.sidebar:
     st.subheader("모델 / 크롤링 옵션")
     CHAT_MODEL = st.selectbox("대화/생성 모델", ["gpt-4o-mini","gpt-4o"], index=0)
     EMBED_MODEL = st.selectbox("임베딩 모델", ["text-embedding-3-small","text-embedding-3-large"], index=0)
     SELENIUM_TIMEOUT = st.slider("Selenium 대기(초)", 6, 30, 14)
-    MAX_PAGES = st.slider("회사 홈페이지 최대 페이지 수", 6, 30, 12)
-    FAST_MODE = st.toggle("Fast 모드(스크롤·대기 최소화)", value=True)
+    FAST_MODE = st.toggle("Fast 모드(빠르게)", value=True)
 
-# ======================= html2text ========================
-def _h2t():
+# -----------------------------------------------------------------------------
+# html2text
+# -----------------------------------------------------------------------------
+def _get_html2text():
     conv = html2text.HTML2Text()
     conv.ignore_links = True
     conv.ignore_images = True
     conv.body_width = 0
     return conv
-H2T = _h2t()
+HTML2TEXT = _get_html2text()
 
 def html_to_text(html_str: str) -> str:
-    txt = H2T.handle(html_str or "")
+    txt = HTML2TEXT.handle(html_str or "")
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return re.sub(r"\s+", " ", txt).strip()
 
-def clean_text(s: str, max_len: int = 16000) -> str:
-    if not s: return ""
-    s = re.sub(r"\r", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:max_len] if len(s) > max_len else s
-
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
 def normalize_url(u: str) -> Optional[str]:
     if not u: return None
     u = u.strip()
@@ -63,21 +70,24 @@ def normalize_url(u: str) -> Optional[str]:
     parts = urllib.parse.urlsplit(u)
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
 
-# ======================= Selenium =========================
-HAS_SELENIUM = True
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException
-except Exception:
-    HAS_SELENIUM = False
-    st.error("Selenium이 필요합니다. pip install selenium && 로컬 크롬 설치 확인")
-    st.stop()
+def clean_text(s: str, max_len: int = 16000) -> str:
+    if not s: return ""
+    s = re.sub(r"\r", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len] if len(s) > max_len else s
+
+# =============================================================================
+# 2. Selenium Driver/Crawler
+# =============================================================================
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 def _pick_chrome_binary() -> Optional[str]:
+    # 환경 변수 및 공통 경로에서 Chrome 바이너리 경로 탐색
     cands = [
         os.getenv("CHROME_BIN"), os.getenv("GOOGLE_CHROME_BIN"),
         shutil.which("chromium"), shutil.which("chromium-browser"),
@@ -89,99 +99,94 @@ def _pick_chrome_binary() -> Optional[str]:
         if p and os.path.exists(p): return p
     return None
 
-def build_driver(headless: bool=True):
+def _build_chrome(headless: bool = True):
     opts = ChromeOptions()
     if headless: opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1440,2200")
+    opts.add_argument("--window-size=1440,2400")
     opts.add_argument("--lang=ko-KR")
     binpath = _pick_chrome_binary()
     if binpath: opts.binary_location = binpath
-    driver = webdriver.Chrome(options=opts)   # Selenium Manager auto-download
+    driver = webdriver.Chrome(options=opts)  # Selenium Manager 자동 사용
     return driver
 
-def wait_dom(driver, timeout: int):
-    try:
-        WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, "//*")))
-    except TimeoutException:
-        pass
-
-def smart_scroll(driver, loops: int = 6):
-    loops = 3 if FAST_MODE else loops
-    for _ in range(loops):
-        try:
-            driver.execute_script("window.scrollBy(0, document.body.scrollHeight*0.6);")
-            time.sleep(0.12 if FAST_MODE else 0.25)
-        except Exception:
-            break
-
-def click_more_generic(driver):
-    texts = ["더보기","전체보기","상세보기","자세히 보기","Read more","More","보기"]
+# -----------------------------------------------------------------------------
+# Domain expand helpers
+# -----------------------------------------------------------------------------
+def _click_by_text_candidates(driver, texts: List[str], per=12):
     for t in texts:
         try:
             xp1 = f"//*[normalize-space(text())='{t}']"
             xp2 = f"//*[contains(normalize-space(text()), '{t}')]"
             for xp in (xp1, xp2):
-                for el in driver.find_elements(By.XPATH, xp)[:6]:
+                els = driver.find_elements(By.XPATH, xp)
+                for el in els[:per]:
                     try:
                         driver.execute_script("arguments[0].click();", el)
-                        time.sleep(0.08 if FAST_MODE else 0.18)
+                        time.sleep(0.12 if FAST_MODE else 0.25)
                     except Exception:
                         continue
         except Exception:
             continue
 
-def expand_portal_specific(driver, host: str):
-    if "wanted.co.kr" in host:
-        sels = [
-            "[data-qa='btn-read-more']","[data-qa='job-header__more']",
-            "button[aria-expanded='false']","[role='button'][class*='More']",
-        ]
-    elif "saramin" in host:
-        sels = [".btn_more",".btnMore",".btn-detail",".btn_toggle","button[class*='more'], a[class*='more']"]
-    elif "jobkorea" in host:
-        sels = [".btnFold",".btnToggleRead",".btn_more","button[class*='More'], a[class*='More']"]
-    else:
-        sels = []
-    for sel in sels:
+def _click_many_css(driver, selectors: List[str], per=12):
+    for sel in selectors:
         try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel)[:8]:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els[:per]:
                 try:
                     driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.08 if FAST_MODE else 0.18)
+                    time.sleep(0.1 if FAST_MODE else 0.2)
                 except Exception:
                     continue
         except Exception:
             continue
 
-def get_html_dynamic(url: str, timeout: int) -> str:
-    url = normalize_url(url) or url
-    driver = build_driver(headless=True)
-    try:
-        driver.set_page_load_timeout(timeout)
-        driver.get(url)
-        wait_dom(driver, timeout)
-        host = urllib.parse.urlsplit(url).netloc.lower()
-        expand_portal_specific(driver, host)
-        click_more_generic(driver)
-        smart_scroll(driver, loops=8)
-        return driver.page_source or ""
-    finally:
-        try: driver.quit()
-        except Exception: pass
+def _expand_wanted(driver):
+    sel = [
+        "[data-qa='btn-read-more']","[data-qa='job-header__more']",
+        "button[aria-expanded='false']","[role='button'][class*='More']",
+        "div[aria-expanded='false']",
+    ]
+    _click_many_css(driver, sel, per=(8 if FAST_MODE else 12))
+    _click_by_text_candidates(driver, [
+        "더보기","전체보기","자세히","상세보기","모두 보기",
+        "주요업무","자격요건","우대사항","기업/팀 소개",
+        "나중에 하기","닫기","확인"
+    ], per=(6 if FAST_MODE else 12))
 
-# =================== 채용공고 → 텍스트 ====================
-def extract_wanted_next(html: str) -> str:
+def _expand_saramin(driver):
+    sel = [".btn_more",".btnMore",".btn-detail",".btn_toggle",
+           "[aria-expanded='false']","[role='button']","button[class*='more'], a[class*='more']"]
+    _click_many_css(driver, sel, per=(6 if FAST_MODE else 12))
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세정보"], per=(6 if FAST_MODE else 12))
+
+def _expand_jobkorea(driver):
+    sel = [".btnFold",".btnToggleRead",".btn_more",
+           "[aria-expanded='false']","[role='button']","button[class*='More'], a[class*='More']"]
+    _click_many_css(driver, sel, per=(6 if FAST_MODE else 12))
+    _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","기업정보","상세보기"], per=(6 if FAST_MODE else 12))
+
+# -----------------------------------------------------------------------------
+# Wanted __NEXT_DATA__ → text
+# -----------------------------------------------------------------------------
+def extract_wanted_from_next_html(html: str) -> str:
     try:
         soup = BeautifulSoup(html or "", "html.parser")
         tag = soup.select_one("script#__NEXT_DATA__")
         if not tag: return ""
-        data = json.loads((tag.string or tag.text or "").strip())
+        raw = (tag.string or tag.text or "").strip()
+        data = json.loads(raw)
     except Exception:
         return ""
-    key_whitelist = ["job","position","title","desc","description","responsibilit","duty","role","skill","require","qualification","prefer","plus","nice"]
+    key_whitelist = [
+        "job","position","title","desc","description",
+        "responsibilit","duty","role","skill","stack",
+        "require","qualification","prefer","plus","nice"
+    ]
+    def _safe(x): return re.sub(r"\s+"," ", (x or "")).strip()
     def _walk(d, out):
         if isinstance(d, dict):
             for k, v in d.items():
@@ -191,10 +196,10 @@ def extract_wanted_next(html: str) -> str:
                         for it in v:
                             if isinstance(it, str): out.append(it)
                             elif isinstance(it, dict):
-                                for subv in it.values():
+                                for _, subv in it.items():
                                     if isinstance(subv, str): out.append(subv)
                     elif isinstance(v, dict):
-                        for subv in v.values():
+                        for _, subv in v.items():
                             if isinstance(subv, str): out.append(subv)
                 _walk(v, out)
         elif isinstance(d, list):
@@ -202,120 +207,78 @@ def extract_wanted_next(html: str) -> str:
     bucket=[]; _walk(data, bucket)
     seen=set(); lines=[]
     for t in bucket:
-        s=re.sub(r"\s+"," ", (t or "")).strip()
+        s=_safe(t)
         if len(s)>2 and s not in seen:
             seen.add(s); lines.append(s)
     return "\n".join(lines[:900])
 
-def fetch_job_text_dynamic(url: str, timeout: int) -> Tuple[str, Dict, Optional[str]]:
-    html = get_html_dynamic(url, timeout=timeout)
-    if not html or len(html) < 200:
-        return "", {"source":"selenium_failed","len":0,"url_final":url}, None
-    # wanted next-data merge
-    if "wanted.co.kr" in (urllib.parse.urlsplit(url).netloc.lower()):
-        try:
-            nxt = extract_wanted_next(html)
-            if nxt:
-                html += "\n<div id='__WANTED_NEXT_EXTRACT__'>" + "".join(f"<p>{l}</p>" for l in nxt.split("\n")) + "</div>"
-        except Exception:
-            pass
-    txt = html_to_text(html)
-    return txt, {"source":"selenium","len":len(txt),"url_final":url}, html
-
-# ============== 규칙 파서 (업무/자격/우대) ==================
-def rule_based_sections(raw_text: str) -> dict:
-    txt = clean_text(raw_text, 16000)
-    lines = [re.sub(r"\s+"," ", l).strip(" -•·▶▪️") for l in txt.split("\n") if l.strip()]
-    hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
-    hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
-    hdr_pref = re.compile(r"(우대\s*사항|우대|선호|Preferred|Nice\s*to\s*have|Plus)", re.I)
-    out = {"responsibilities": [], "qualifications": [], "preferences": []}
-    bucket=None
-    def push(line,b):
-        if line and len(line)>1 and line not in out[b]:
-            out[b].append(line[:180])
-    for l in lines:
-        if hdr_resp.search(l): bucket="responsibilities"; continue
-        if hdr_qual.search(l): bucket="qualifications"; continue
-        if hdr_pref.search(l): bucket="preferences"; continue
-        if bucket is None:
-            low = l.lower()
-            if hdr_pref.search(l): bucket = "preferences"
-            elif any(k in low for k in ["java","python","spring","kotlin","react","next","kafka","sql","ml","cloud","aws","gcp"]):
-                bucket = "responsibilities"
-            else:
-                continue
-        push(l,bucket)
-    # 자격→우대 이동
-    kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
-    remain=[]
-    for q in out["qualifications"]:
-        (out["preferences"] if kw_pref.search(q) else remain).append(q)
-    out["qualifications"]=remain
-    # dedup & cap
-    for k in out:
-        seen=set(); clean=[]
-        for s in out[k]:
-            s=re.sub(r"\s+"," ", s).strip(" -•·▶▪️").strip()
-            if s and s not in seen:
-                seen.add(s); clean.append(s)
-        out[k]=clean[:14]
-    return out
-
-# =================== LLM 구조화 ===========================
-PROMPT_SYSTEM_STRUCT = "너는 채용 공고를 한국어로 간결하고 중복 없이 구조화하는 보조원이다."
-def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dict:
-    ctx = clean_text(raw_text, 14000)
-    user_msg = {"role":"user","content":(
-        "다음 채용 공고 원문을 구조화해줘.\n\n"
-        f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
-        f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
-        "--- 원문 시작 ---\n"
-        f"{ctx}\n--- 원문 끝 ---\n\n"
-        "JSON으로만 답:\n"
-        "{"
-        "\"company_name\": str, "
-        "\"company_intro\": str, "
-        "\"job_title\": str, "
-        "\"responsibilities\": [str], "
-        "\"qualifications\": [str], "
-        "\"preferences\": [str]"
-        "}"
-    )}
+# -----------------------------------------------------------------------------
+# Selenium fetch (DOM + NEXT_DATA)
+# -----------------------------------------------------------------------------
+def selenium_get_html(url: str, timeout: int = 14) -> str:
+    driver = _build_chrome(headless=True)
     try:
-        r = client.chat.completions.create(
-            model=model, temperature=0.2, max_tokens=900,
-            response_format={"type":"json_object"},
-            messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg]
-        )
-        data = json.loads(r.choices[0].message.content)
-    except Exception as e:
-        data = {"company_name": meta_hint.get("company_name",""),
-                "company_intro": meta_hint.get("company_intro","원문 정제 실패"),
-                "job_title": meta_hint.get("job_title",""),
-                "responsibilities": [], "qualifications": [], "preferences": [], "error": str(e)}
-    # sanitize
-    for k in ["responsibilities","qualifications","preferences"]:
-        arr = data.get(k, [])
-        if not isinstance(arr, list): arr=[]
-        clean_list=[]; seen=set()
-        for it in arr:
-            t = re.sub(r"\s+"," ", str(it)).strip(" -•·▶▪️").strip()
-            if t and t not in seen:
-                seen.add(t); clean_list.append(t[:180])
-        data[k] = clean_list[:14]
-    # 보정
-    if len(data.get("preferences", [])) < 1:
-        rb = rule_based_sections(ctx)
-        if rb.get("preferences"):
-            merged = data.get("preferences", []) + rb["preferences"]
-            data["preferences"] = list(dict.fromkeys(merged))[:14]
-    for k in ["company_name","company_intro","job_title"]:
-        if isinstance(data.get(k), str): data[k]=re.sub(r"\s+"," ", data[k]).strip()
-    return data
+        driver.set_page_load_timeout(timeout)
+        driver.get(url)
+        try:
+            WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, "//*")))
+        except TimeoutException:
+            pass
 
+        host = urllib.parse.urlsplit(url).netloc.lower()
+        _click_by_text_candidates(driver, ["더보기","상세보기","자세히 보기","전체보기","Read more","More"],
+                                  per=(6 if FAST_MODE else 10))
+        _click_by_text_candidates(driver, ["우대","우대사항","자격요건","주요업무","Requirements","Responsibilities","Preferred"],
+                                  per=(6 if FAST_MODE else 10))
+
+        if "wanted.co.kr" in host: _expand_wanted(driver)
+        if "saramin" in host:     _expand_saramin(driver)
+        if "jobkorea" in host:    _expand_jobkorea(driver)
+
+        loops = 5 if FAST_MODE else 8
+        for _ in range(loops):
+            try:
+                driver.execute_script("window.scrollBy(0, 1200);"); time.sleep(0.12 if FAST_MODE else 0.25)
+            except Exception:
+                break
+
+        html = driver.page_source or ""
+        if "wanted.co.kr" in host:
+            try:
+                txt_next = extract_wanted_from_next_html(html)
+                if txt_next:
+                    html += "\n<div id='__WANTED_NEXT_EXTRACT__'>" + \
+                            "".join([f"<p>{line}</p>" for line in txt_next.split("\n")]) + "</div>"
+            except Exception:
+                pass
+        return html
+    finally:
+        try: driver.quit()
+        except Exception: pass
+
+def fetch_all_text_selenium(url: str, timeout: int = 14) -> Tuple[str, Dict, Optional[str]]:
+    url_n = normalize_url(url)
+    if not url_n: return "", {"error":"invalid_url"}, None
+    try:
+        html = selenium_get_html(url_n, timeout=timeout)
+    except Exception as e:
+        st.error(f"Selenium 로드 실패: {e}")
+        st.code("".join(traceback.format_exc()))
+        return "", {"source":"selenium_error","len":0,"url_final":url_n}, None
+    if not html or len(html) < 200:
+        return "", {"source":"selenium_failed","len":0,"url_final":url_n}, None
+    txt = html_to_text(html)
+    return txt, {"source":"selenium","len":len(txt),"url_final":url_n}, html
+
+# =============================================================================
+# 3. 데이터 파싱 및 정제
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Meta & rule-based sections (ONLY 3 buckets)
+# -----------------------------------------------------------------------------
 def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
-    meta = {"company_name":"","company_intro":"","job_title":""}
+    meta = {"company_name": "", "company_intro": "", "job_title": ""}
     if not html: return meta
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -327,7 +290,7 @@ def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
         if soup.title and soup.title.string: cand.append(soup.title.string)
         cand = [re.split(r"[\-\|\·\—]", c)[0].strip() for c in cand if c]
         cand = [c for c in cand if 2 <= len(c) <= 40]
-        meta["company_name"] = (cand[0] if cand else "")
+        meta["company_name"] = cand[0] if cand else ""
         md = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
         if md and md.get("content"):
             meta["company_intro"] = re.sub(r"\s+"," ", md["content"]).strip()[:500]
@@ -345,180 +308,118 @@ def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
         pass
     return meta
 
-# ============ 회사 홈페이지(동적 전용) =====================
-VISION_KEYS = [
-    "비전","미션","핵심가치","가치","철학","원칙","소개","연혁","문화",
-    "purpose","mission","vision","values","value","principle","philosophy",
-    "culture","esg","sustainability","about","company","who we are","what we do",
-    "our story","brand","story"
-]
-TALENT_KEYS = [
-    "인재","인재상","채용철학","인사제도","people","talent",
-    "who we hire","what we look for","team","careers","recruit","채용"
-]
-PORTAL_DOMAINS = {"wanted.co.kr","saramin.co.kr","jobkorea.co.kr","linkedin.com","kr.indeed.com","rocketpunch.com"}
+def rule_based_sections(raw_text: str) -> dict:
+    txt = clean_text(raw_text, 16000)
+    lines = [re.sub(r"\s+"," ", l).strip(" -•·▶▪️") for l in txt.split("\n") if l.strip()]
 
-def _domain(host: str) -> str:
-    parts = host.split(".")
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return host
+    hdr_resp = re.compile(r"(주요\s*업무|담당\s*업무|Role|Responsibilities?)", re.I)
+    hdr_qual = re.compile(r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?)", re.I)
+    hdr_pref = re.compile(r"(우대\s*사항|우대|선호|Preferred|Nice\s*to\s*have|Plus)", re.I)
 
-def collect_nav_links_dynamic(html: str, base_url: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
-    cands=[]
-    for a in soup.find_all("a", href=True):
-        txt  = (a.get_text(" ", strip=True) or "").lower()
-        href = a["href"].strip()
-        hlow = href.lower()
-        if any(k in txt for k in [k.lower() for k in VISION_KEYS + TALENT_KEYS]) or \
-           any(k in hlow for k in [
-               "about","company","mission","vision","values","culture",
-               "people","talent","careers","recruit","esg","sustainability",
-               "/kr","/ko","/ko-kr","who-we-are","what-we-do","our-story","brand"
-           ]):
-            cands.append(urllib.parse.urljoin(base_url, href))
-    uniq,s=set(),[]
-    out=[]
-    for u in cands:
-        if u not in uniq:
-            uniq.add(u); out.append(u)
-    return out[:18]
+    out = {"responsibilities": [], "qualifications": [], "preferences": []}
+    bucket=None
 
-def parse_jsonld_and_meta(html: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
-    out=[]
-    for sel in ["meta[name='description']","meta[property='og:description']","meta[property='og:title']"]:
-        tag = soup.select_one(sel)
-        if tag and tag.get("content"):
-            out.append(tag["content"])
-    for tag in soup.select("script[type='application/ld+json']"):
-        try:
-            data = json.loads(tag.text)
-        except Exception:
-            continue
-        nodes = data if isinstance(data, list) else [data]
-        for node in nodes:
-            if not isinstance(node, dict): continue
-            if str(node.get("@type","")).lower() in ("organization","website","webpage","aboutpage"):
-                for k in ("description","mission","value","headline","about","name"):
-                    v = node.get(k)
-                    if isinstance(v,str) and 6 <= len(v) <= 260:
-                        out.append(v)
-    uniq=set(); res=[]
-    for t in out:
-        t = re.sub(r"\s+"," ", t).strip()
-        if t and t not in uniq:
-            uniq.add(t); res.append(t)
-    return res
+    def push(line,b):
+        if line and len(line)>1 and line not in out[b]:
+            out[b].append(line[:180])
 
-def extract_texts(html: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
-    texts=[]
-    for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
-        t = tag.get_text(" ", strip=True)
-        if not t: continue
-        t = re.sub(r"\s+"," ", t)
-        if 6 <= len(t) <= 260:
-            texts.append(t)
-    return texts
+    for l in lines:
+        if hdr_resp.search(l): bucket="responsibilities"; continue
+        if hdr_qual.search(l): bucket="qualifications"; continue
+        if hdr_pref.search(l): bucket="preferences"; continue
 
-def company_home_dynamic(home_url: str, timeout: int, max_pages: int) -> Dict[str, List[str]]:
-    out = {"vision": [], "talent": []}
-    base = normalize_url(home_url or "")
-    if not base: return out
-    # 시작 후보
-    roots = [base.rstrip("/")]
-    for loc in ("/kr","/ko","/ko-kr"):
-        roots.append(base.rstrip("/") + loc)
-    for p in ("/about","/company","/about-us","/mission","/vision","/values",
-              "/culture","/careers","/talent","/people","/esg","/sustainability",
-              "/who-we-are","/what-we-do","/our-story","/brand"):
-        roots.append(base.rstrip("/") + p)
-    visited=set()
-    queue = [(u,0) for u in roots]
-    MAX_DEPTH = 1
-    def classify_add(texts: List[str]):
-        for t in texts:
-            low = t.lower()
-            if any(k in low for k in [k.lower() for k in TALENT_KEYS]): out["talent"].append(t)
-            if any(k in low for k in [k.lower() for k in VISION_KEYS]): out["vision"].append(t)
-    pages=0
-    while queue and pages < max_pages:
-        url, depth = queue.pop(0)
-        if url in visited: continue
-        visited.add(url); pages+=1
-        html = get_html_dynamic(url, timeout=timeout)
-        if not html: continue
-        smart_scroll(build_driver(headless=True) if False else None)  # no-op (placeholder)
-        classify_add(extract_texts(html))
-        classify_add(parse_jsonld_and_meta(html))
-        if depth < MAX_DEPTH and url in roots:
-            for nxt in collect_nav_links_dynamic(html, url):
-                if nxt not in visited: queue.append((nxt, depth+1))
-    # post
+        if bucket is None:
+            low = l.lower()
+            if hdr_pref.search(l):
+                bucket = "preferences"
+            elif any(k in low for k in ["java","python","spring","kotlin","react","next","kafka","sql","ml","cloud","aws","gcp"]):
+                bucket = "responsibilities"
+            else:
+                continue
+        push(l,bucket)
+
+    # 자격 → 우대 이동
+    kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
+    remain=[]
+    for q in out["qualifications"]:
+        (out["preferences"] if kw_pref.search(q) else remain).append(q)
+    out["qualifications"]=remain
+
+    # 중복 제거
     for k in out:
-        uniq=set(); res=[]
-        for x in out[k]:
-            x = re.sub(r"\s+"," ", x).strip()
-            if x and x not in uniq:
-                uniq.add(x); res.append(x[:200])
-        out[k]=res[:30]
+        seen=set(); clean=[]
+        for s in out[k]:
+            s=re.sub(r"\s+"," ", s).strip(" -•·▶▪️").strip()
+            if s and s not in seen:
+                seen.add(s); clean.append(s)
+        out[k]=clean[:14]
     return out
 
-def infer_home_from_job(job_html: str, job_url: str, company_name: str) -> List[str]:
-    soup = BeautifulSoup(job_html or "", "lxml")
-    anchors = soup.find_all("a", href=True)
-    cands=[]
-    cmp_l = (company_name or "").lower()
-    for a in anchors:
-        href = a["href"].strip()
-        txt  = (a.get_text(" ", strip=True) or "").lower()
-        url  = urllib.parse.urljoin(job_url, href)
-        host = urllib.parse.urlsplit(url).netloc.lower()
-        if not host or _domain(host) in PORTAL_DOMAINS:
-            continue
-        score = 0
-        if cmp_l and cmp_l in txt: score += 2
-        if any(k in txt for k in [k.lower() for k in VISION_KEYS+TALENT_KEYS]): score += 2
-        if url.endswith("/") or url.count("/") <= 3: score += 1
-        cands.append((url, score))
-    scored = Counter()
-    for it in cands:
-        scored[it[0]] += it[1]
-    candidates = [u for u,_ in scored.most_common()]
-    # 루트 도메인 정규화
-    roots=[]; seen=set()
-    for u in candidates:
-        pu = urllib.parse.urlsplit(u)
-        root = f"{pu.scheme}://{pu.netloc}/"
-        if root not in seen:
-            seen.add(root); roots.append(root)
-    return roots[:5] or candidates[:5]
+# -----------------------------------------------------------------------------
+# LLM structure / Q&A / scoring
+# -----------------------------------------------------------------------------
+PROMPT_SYSTEM_STRUCT = ("너는 채용 공고를 깔끔하게 구조화하는 보조원이다. 한국어로 간결하고 중복없이 정제하라.")
 
-# ===================== 뉴스 (RSS) =========================
-@st.cache_data(show_spinner=False, ttl=1200)
-def google_news_rss_multi(company: str, max_items: int = 5) -> List[Dict]:
-    def rss(q):
-        url = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=ko&gl=KR&ceid=KR:ko"
-        try:
-            r = requests.get(url, timeout=6)
-            if r.status_code != 200: return []
-            soup = BeautifulSoup(r.text, "xml")
-            out=[]
-            for it in soup.find_all("item")[:max_items]:
-                out.append({"title": (it.title.get_text() if it.title else "").strip(),
-                            "link": (it.link.get_text() if it.link else "").strip(),
-                            "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()})
-            return out
-        except Exception:
-            return []
-    for q in [company, f"\"{company}\" 회사", f"\"{company}\" 채용"]:
-        res = rss(q)
-        if res: return res
-    return []
+def llm_structurize(raw_text: str, meta_hint: Dict[str, str], model: str) -> Dict:
+    ctx = clean_text(raw_text, 14000)
+    user_msg = {"role": "user", "content": (
+        "다음 채용 공고 원문을 구조화해줘.\n\n"
+        f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
+        f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
+        "--- 원문 시작 ---\n"
+        f"{ctx}\n"
+        "--- 원문 끝 ---\n\n"
+        "JSON으로만 답하고, 키는 반드시 아래만 포함:\n"
+        "{"
+        "\"company_name\": str, "
+        "\"company_intro\": str, "
+        "\"job_title\": str, "
+        "\"responsibilities\": [str], "
+        "\"qualifications\": [str], "
+        "\"preferences\": [str]"
+        "}\n"
+        "- '우대 사항(preferences)'에는 역량/경험/지식 조건만 포함.\n"
+        "- 불릿/이모지 제거, 문장 간결화, 중복 제거."
+    )}
+    try:
+        resp = client.chat.completions.create(
+            model=model, temperature=0.2, max_tokens=950,
+            response_format={"type": "json_object"},
+            messages=[{"role":"system","content":PROMPT_SYSTEM_STRUCT}, user_msg]
+        )
+        data = json.loads(resp.choices[0].message.content)
+    except Exception as e:
+        data = {"company_name": meta_hint.get("company_name",""),
+                "company_intro": meta_hint.get("company_intro","원문 정제 실패"),
+                "job_title": meta_hint.get("job_title",""),
+                "responsibilities": [], "qualifications": [], "preferences": [], "error": str(e)}
 
-# ======================= 임베딩/RAG =======================
+    for k in ["responsibilities","qualifications","preferences"]:
+        arr = data.get(k, [])
+        if not isinstance(arr, list): arr=[]
+        clean_list=[]; seen=set()
+        for it in arr:
+            t = re.sub(r"\s+"," ", str(it)).strip(" -•·▶▪️").strip()
+            if t and t not in seen:
+                seen.add(t); clean_list.append(t[:180])
+        data[k] = clean_list[:14]
+
+    if len(data.get("preferences", [])) < 1:
+        rb = rule_based_sections(ctx)
+        if rb.get("preferences"):
+            merged = data.get("preferences", []) + rb["preferences"]
+            data["preferences"] = list(dict.fromkeys(merged))[:14]
+        else:
+            kw_pref = re.compile(r"(우대|선호|preferred|plus|가산점|있으면\s*좋음)", re.I)
+            remain=[]; moved=[]
+            for q in data.get("qualifications", []):
+                (moved if kw_pref.search(q) else remain).append(q)
+            data["preferences"]=moved[:14]; data["qualifications"]=remain[:14]
+
+    for k in ["company_name","company_intro","job_title"]:
+        if isinstance(data.get(k), str): data[k]=re.sub(r"\s+"," ", data[k]).strip()
+    return data
+
 def chunk(text: str, size: int = 600, overlap: int = 120) -> List[str]:
     t = re.sub(r"\s+"," ", text or "").strip()
     out=[]; start=0; L=len(t)
@@ -547,9 +448,14 @@ def retrieve_resume_chunks(query: str, chunks: List[str], embeds: np.ndarray, k:
     scores, idxs = cosine_topk(embeds, qv, k=k)
     return [(float(s), chunks[int(i)]) for s, i in zip(scores, idxs)]
 
-PROMPT_SYSTEM_Q = "너는 채용담당자다. 회사/직무/요건과 이력서를 고려해 좋은 한국어 질문을 만든다."
-PROMPT_SYSTEM_DRAFT = "너는 면접 코치다. STAR로 8~12문장 한국어 답변 초안을 작성한다."
+PROMPT_SYSTEM_Q = ("너는 채용담당자다. 회사/직무 맥락과 채용요건, 지원자 이력서를 함께 고려해 "
+                   "서로 겹치지 않는 고품질 한국어 면접 질문을 만든다. 수치/지표/기간/규모/리스크/트레이드오프를 섞어라.")
+PROMPT_SYSTEM_DRAFT = ("너는 면접 답변 코치다. 회사/직무/채용요건과 지원자의 이력서 요약을 결합해 "
+                       "STAR(상황-과제-행동-성과)로 8~12문장 답변 **초안**을 한국어로 작성한다.")
+
 CRITERIA = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
+PROMPT_SYSTEM_SCORE_STRICT = ("너는 매우 엄격한 톱티어 면접 코치다. 아래 형식의 JSON만 출력하라. "
+                              "각 기준은 0~20 정수이며 총점은 합계(100)와 일치해야 한다.")
 
 def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str,
                                           resume_chunks: List[str], resume_embeds: np.ndarray) -> str:
@@ -563,7 +469,8 @@ def llm_generate_one_question_with_resume(clean: Dict, level: str, model: str,
         r = client.chat.completions.create(model=model, temperature=0.8, max_tokens=120,
                                            messages=[{"role":"system","content":PROMPT_SYSTEM_Q}, user_msg])
         q = r.choices[0].message.content.strip()
-        return re.sub(r"^\s*\d+[\).\s-]*","", q).split("\n")[0].strip()
+        q = re.sub(r"^\s*\d+[\).\s-]*","", q).split("\n")[0].strip()
+        return q
     except Exception:
         return ""
 
@@ -605,19 +512,19 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
     try:
         r = client.chat.completions.create(model=model, temperature=0.2, max_tokens=900,
                                            response_format={"type":"json_object"},
-                                           messages=[{"role":"system","content":"면접 코치(엄격 모드)"}, user_msg])
+                                           messages=[{"role":"system","content":PROMPT_SYSTEM_SCORE_STRICT}, user_msg])
         data = json.loads(r.choices[0].message.content)
-        # normalize
         fixed=[]
         for name in CRITERIA:
-            cur=None
+            found=None
             for it in data.get("criteria", []):
-                if str(it.get("name","")).strip()==name: cur=it; break
-            if not cur: cur={"name":name,"score":0,"comment":""}
-            sc=int(cur.get("score",0)); sc=max(0,min(20,sc))
-            cur["score"]=sc; cur["comment"]=str(cur.get("comment","")).strip()
-            fixed.append(cur)
-        data["criteria"]=fixed; data["overall_score"]=sum(x["score"] for x in fixed)
+                if str(it.get("name","")).strip()==name: found=it; break
+            if not found: found={"name":name,"score":0,"comment":""}
+            sc=int(found.get("score",0)); sc=max(0,min(20,sc))
+            found["score"]=sc; found["comment"]=str(found.get("comment","")).strip()
+            fixed.append(found)
+        total=sum(x["score"] for x in fixed)
+        data["criteria"]=fixed; data["overall_score"]=total
         for k in ["strengths","risks","improvements"]:
             arr=data.get(k,[]); 
             if not isinstance(arr,list): arr=[]
@@ -628,76 +535,283 @@ def llm_score_and_coach_strict(clean: Dict, question: str, answer: str, model: s
         return {"overall_score":0,"criteria":[{"name":n,"score":0,"comment":""} for n in CRITERIA],
                 "strengths": [],"risks": [],"improvements": [],"revised_answer":"", "error":str(e)}
 
-# ======================= 상태 =============================
-def _init_state():
-    defaults = dict(
-        clean=None, last_html=None,
-        company_vision=[], company_talent=[], company_news=[],
-        auto_home_used="",
-        resume_chunks=[], resume_embeds=None, resume_raw="",
-        current_question="", answer_text="", last_result=None,
-        followups=[], selected_followup="", followup_answer="",
-    )
+# =============================================================================
+# 4. 회사 페이지 / 뉴스 크롤링
+# =============================================================================
+@st.cache_data(show_spinner=False, ttl=3600)
+def _http_get(url: str, timeout: int = 8) -> str:
+    try:
+        r = requests.get(url, timeout=timeout, headers={
+            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+            "Accept-Language":"ko, en;q=0.9"
+        })
+        if r.status_code==200: return r.text
+    except Exception:
+        pass
+    return ""
+
+# JSON-LD/메타에서 설명 문장 후보 뽑기
+def _parse_jsonld_and_meta(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    out=[]
+    desc = (soup.select_one("meta[name='description']") or {}).get("content")
+    if desc: out.append(desc)
+    ogd  = (soup.select_one("meta[property='og:description']") or {}).get("content")
+    ogt  = (soup.select_one("meta[property='og:title']") or {}).get("content")
+    for x in (ogt, ogd):
+        if x and x not in out: out.append(x)
+    for tag in soup.select("script[type='application/ld+json']"):
+        try:
+            data = json.loads(tag.text)
+        except Exception:
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict): continue
+            t = str(node.get("@type","")).lower()
+            if t in ("organization","website","jobposting","webpage","aboutpage"):
+                for k in ("description","mission","value","headline","about","name"):
+                    v = node.get(k)
+                    if isinstance(v,str) and 6 <= len(v) <= 260:
+                        out.append(v)
+    # dedup
+    uniq,s=[],set()
+    for x in out:
+        if x not in s:
+            s.add(x); uniq.append(x)
+    return uniq
+
+# 홈에서 내비게이션 링크(About/비전/인재상/채용/ESG 등) 후보 수집
+VISION_KEYS = [
+    "비전","미션","핵심가치","가치","원칙","철학",
+    "purpose","mission","vision","values","principle","philosophy",
+    "culture","esg","sustainability","about","company"
+]
+TALENT_KEYS = [
+    "인재","인재상","people","talent","who we hire",
+    "what we look for","team","careers","recruit","채용"
+]
+
+def _collect_nav_links(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    cands=[]
+    for a in soup.find_all("a", href=True):
+        txt  = (a.get_text(" ", strip=True) or "").lower()
+        href = a["href"].strip()
+        hlow = href.lower()
+        if any(k in txt for k in [k.lower() for k in VISION_KEYS + TALENT_KEYS]) or \
+           any(k in hlow for k in [
+               "about","company","mission","vision","values","culture",
+               "people","talent","careers","recruit","esg","sustainability",
+               "/kr","/ko","/ko-kr"
+           ]):
+            cands.append(urllib.parse.urljoin(base_url, href))
+    uniq,s=[],set()
+    for u in cands:
+        if u not in s:
+            s.add(u); uniq.append(u)
+    return uniq[:15]
+
+# 본문에서 문장 추출
+def _extract_texts(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    texts=[]
+    for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
+        t = tag.get_text(" ", strip=True)
+        if not t: continue
+        t = re.sub(r"\s+"," ", t)
+        if 6 <= len(t) <= 260:
+            texts.append(t)
+    return texts
+
+# ★ 강화된 기업 홈페이지 수집기: 정적→동적 폴백 + 홈→내비(깊이1)
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_company_pages(home_url: str) -> Dict[str, List[str]]:
+    out = {"vision": [], "talent": []}
+    base = normalize_url(home_url or "")
+    if not base: return out
+
+    # 시작 후보(언어/대표 경로 포함)
+    roots = [base.rstrip("/")]
+    for loc in ("/kr","/ko","/ko-kr"):
+        roots.append(base.rstrip("/") + loc)
+    for p in ("/about","/company","/about-us","/mission","/vision","/values",
+              "/culture","/careers","/talent","/people","/esg","/sustainability",
+              "/kr/about","/ko/about"):
+        roots.append(base.rstrip("/") + p)
+
+    visited=set()
+    queue = [(u,0) for u in roots]
+    MAX_DEPTH = 1
+
+    def classify_add(texts: List[str]):
+        for t in texts:
+            low = t.lower()
+            if any(k in low for k in [k.lower() for k in TALENT_KEYS]):
+                out["talent"].append(t)
+            if any(k in low for k in [k.lower() for k in VISION_KEYS]):
+                out["vision"].append(t)
+
+    while queue:
+        url, depth = queue.pop(0)
+        if url in visited: continue
+        visited.add(url)
+
+        # 1) 정적
+        html = _http_get(url, timeout=8)
+
+        # 2) 부족/동적 페이지면 Selenium 폴백(있을 때만)
+        if (not html or len(html) < 1200):
+            try:
+                html_dyn = selenium_get_html(url, timeout=SELENIUM_TIMEOUT)
+                if html_dyn and len(html_dyn) >= 100:
+                    html = html_dyn
+            except Exception:
+                pass
+
+        if not html:
+            continue
+
+        # 본문 + JSON-LD/메타에서 후보 문장 취합
+        classify_add(_extract_texts(html))
+        classify_add(_parse_jsonld_and_meta(html))
+
+        # 홈/대표 경로에서는 내비 링크 깊이 깊이 1까지 탐색
+        if depth < MAX_DEPTH and url in roots:
+            for nxt in _collect_nav_links(html, url):
+                if nxt not in visited:
+                    queue.append((nxt, depth+1))
+
+    # 후처리: 중복/길이 제한
+    for k in out:
+        uniq=[]; s=set()
+        for x in out[k]:
+            x = x.strip()
+            if not x: continue
+            if x in s: continue
+            s.add(x)
+            uniq.append(x[:200])
+        out[k] = uniq[:30]
+    return out
+
+@st.cache_data(show_spinner=False, ttl=1200)
+def google_news_rss(company: str, max_items: int = 5) -> List[Dict]:
+    if not company: return []
+    q = urllib.parse.quote(company)
+    url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+    try:
+        r = requests.get(url, timeout=6)
+        if r.status_code != 200: return []
+        soup = BeautifulSoup(r.text, "xml")
+        out=[]
+        for it in soup.find_all("item")[:max_items]:
+            out.append({"title": (it.title.get_text() if it.title else "").strip(),
+                        "link": (it.link.get_text() if it.link else "").strip(),
+                        "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()})
+        return out
+    except Exception:
+        return []
+
+# =============================================================================
+# 5. Streamlit 세션 상태 초기화
+# =============================================================================
+def init_session_state():
+    # 코드 구조의 명확성을 위해 상태 초기화 로직을 분리
+    defaults = {
+        "clean_struct": None,
+        "resume_raw": "",
+        "resume_chunks": [],
+        "resume_embeds": None,
+        "current_question": "",
+        "answer_text": "",
+        "last_result": None,
+        "followups": [],
+        "selected_followup": "",
+        "followup_answer": "",
+        "company_home": "",
+        "company_vision": [],
+        "company_talent": [],
+        "company_news": [],
+        "last_html": None,
+    }
     for k,v in defaults.items():
         if k not in st.session_state: st.session_state[k]=v
-_init_state()
+init_session_state()
 
-# ======================= UI 1: 수집 =======================
+# =============================================================================
+# 6. Streamlit UI (Main)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# UI 1) 채용 공고 URL + (선택) 기업 홈페이지 URL
+# -----------------------------------------------------------------------------
 st.header("1) 채용 공고 URL (Selenium 전용)")
 job_url = st.text_input("채용 공고 상세 URL", placeholder="원티드/사람인/잡코리아/기업 채용 페이지 URL")
-st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력(미입력 시 자동 추론)")
+st.text_input("회사 공식 홈페이지 URL (선택)", key="company_home", placeholder="회사 공식 홈페이지 URL을 입력하세요.")
 
-if st.button("원문 수집 → 정제", type="primary"):
+if st.button("원문 수집 → 정제 (Selenium ONLY)", type="primary"):
     if not job_url.strip():
-        st.warning("채용 공고 URL을 입력하세요.")
+        st.warning("URL을 입력하세요.")
     else:
-        with st.spinner("채용 공고 로딩/정제 중..."):
-            raw, meta, html = fetch_job_text_dynamic(job_url.strip(), timeout=SELENIUM_TIMEOUT)
+        with st.spinner("Selenium으로 원문 수집 중..."):
+            raw, meta, html = fetch_all_text_selenium(job_url.strip(), timeout=SELENIUM_TIMEOUT)
             hint = extract_company_meta_from_html(html)
             st.session_state.last_html = html
-            if not raw:
-                st.error("채용 공고 수집 실패")
-            else:
-                st.caption(f"소스: {meta.get('source')} · 텍스트 길이: {meta.get('len')}")
-                st.session_state.clean = llm_structurize(raw, hint, CHAT_MODEL)
 
-        if st.session_state.clean:
-            # 회사 홈페이지: 입력 우선, 없으면 자동 추론
-            with st.spinner("회사 홈페이지(비전/인재상) 수집 중..."):
-                vision, talent, used = [], [], ""
-                home_input = st.session_state.company_home.strip()
-                tried = []
+        st.caption(f"수집 소스: {meta.get('source')} · 텍스트 길이: {meta.get('len')}")
+        if not raw:
+            st.error("수집 실패(로그인/동적 렌더링/봇 차단 가능).")
+        else:
+            with st.spinner("정제 및 부가정보 수집 중..."):
+                tasks=[]
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    tasks.append(("clean", ex.submit(llm_structurize, raw, hint, CHAT_MODEL)))
+                    if st.session_state.company_home.strip():
+                        tasks.append(("pages", ex.submit(fetch_company_pages, st.session_state.company_home.strip())))
+                    # 뉴스용 회사명: clean → hint → 도메인 추정
+                    domain_fallback = ""
+                    try:
+                        domain_fallback = urllib.parse.urlsplit(job_url).netloc.split(":")[0].split(".")[0]
+                    except Exception:
+                        pass
+                    tasks.append(("news", ex.submit(google_news_rss, (hint.get("company_name","") or domain_fallback), 5)))
 
-                # 자동 후보
-                auto_candidates = infer_home_from_job(
-                    job_html=html or "", job_url=meta.get("url_final","") or job_url,
-                    company_name=st.session_state.clean.get("company_name","")
-                )
+                    clean=None; vis=[]; tal=[]; news=[]
+                    for name, fut in tasks:
+                        try:
+                            res = fut.result()
+                            if name=="clean": clean=res
+                            elif name=="pages":
+                                vis = res.get("vision", []); tal = res.get("talent", [])
+                            elif name=="news": news = res or []
+                        except Exception:
+                            continue
 
-                for candidate in ([home_input] if home_input else []) + auto_candidates:
-                    if not candidate: continue
-                    tried.append(candidate)
-                    pages = company_home_dynamic(candidate, timeout=SELENIUM_TIMEOUT, max_pages=MAX_PAGES)
-                    if pages.get("vision") or pages.get("talent"):
-                        vision = pages.get("vision", [])
-                        talent = pages.get("talent", [])
-                        used = candidate if not home_input else home_input
-                        break
+                # clean이 나온 뒤 회사명이 잡혔다면 뉴스 재시도(빈 경우)
+                if clean and not news:
+                    cname = clean.get("company_name","") or hint.get("company_name","") or domain_fallback
+                    try:
+                        news = google_news_rss(cname, 5)
+                    except Exception:
+                        news = []
 
-                st.session_state.company_vision = vision
-                st.session_state.company_talent = talent
-                st.session_state.auto_home_used = used
+                # 규칙 파서 보강
+                if clean:
+                    rb = rule_based_sections(raw)
+                    if not clean.get("preferences") and rb.get("preferences"):
+                        clean["preferences"]=rb["preferences"]
 
-            # 뉴스
-            with st.spinner("뉴스 수집 중..."):
-                cname = st.session_state.clean.get("company_name","") or ""
-                st.session_state.company_news = google_news_rss_multi(cname, 5)
-
+                st.session_state.clean_struct = clean
+                st.session_state.company_vision = vis
+                st.session_state.company_talent = tal
+                st.session_state.company_news = news
             st.success("정제 완료!")
 
-# ======================= UI 2: 회사 요약 ===================
+# -----------------------------------------------------------------------------
+# UI 2) 회사 요약 (3개 컬럼)
+# -----------------------------------------------------------------------------
 st.header("2) 회사 요약")
-clean = st.session_state.clean
+clean = st.session_state.clean_struct
 if clean:
     st.markdown(f"**회사명:** {clean.get('company_name','-')}")
     st.markdown(f"**간단한 회사 소개(요약):** {clean.get('company_intro','-')}")
@@ -705,38 +819,45 @@ if clean:
     c1,c2,c3 = st.columns(3)
     with c1:
         st.markdown("**주요 업무**")
-        for b in clean.get("responsibilities", []): st.markdown(f"- {b}")
+        for b in clean.get("responsibilities", []):
+            st.markdown(f"- {b}")
     with c2:
         st.markdown("**자격 요건**")
-        for b in clean.get("qualifications", []): st.markdown(f"- {b}")
+        for b in clean.get("qualifications", []):
+            st.markdown(f"- {b}")
     with c3:
         st.markdown("**우대 사항**")
         prefs = clean.get("preferences", [])
         if prefs:
-            for b in prefs: st.markdown(f"- {b}")
+            for b in prefs:
+                st.markdown(f"- {b}")
         else:
             st.caption("명시된 우대 사항이 없습니다.")
 else:
     st.info("먼저 URL을 정제해 주세요.")
 
-# =================== UI 2.5: 비전/인재상/뉴스 =============
+# -----------------------------------------------------------------------------
+# UI 2.5) 회사 비전/인재상 & 최신 이슈
+# -----------------------------------------------------------------------------
 st.divider()
 st.subheader("회사 비전/인재상 & 최신 이슈")
+
 vcol, tcol = st.columns(2)
 with vcol:
     st.markdown("**비전/핵심가치**")
     if st.session_state.company_vision:
-        for v in st.session_state.company_vision[:8]: st.markdown(f"- {v}")
+        for v in st.session_state.company_vision[:8]:
+            st.markdown(f"- {v}")
     else:
-        st.caption("비전/핵심가치를 찾지 못했습니다.")
+        st.caption("비전/핵심가치를 찾지 못했습니다. (회사 홈페이지 URL을 입력해 보세요)")
+
 with tcol:
     st.markdown("**인재상**")
     if st.session_state.company_talent:
-        for t in st.session_state.company_talent[:8]: st.markdown(f"- {t}")
+        for t in st.session_state.company_talent[:8]:
+            st.markdown(f"- {t}")
     else:
         st.caption("인재상 정보를 찾지 못했습니다.")
-if st.session_state.auto_home_used:
-    st.caption(f"회사 홈페이지 사용: {st.session_state.auto_home_used}")
 
 st.markdown("**최신 뉴스(상위 3~5)**")
 if st.session_state.company_news:
@@ -747,53 +868,61 @@ else:
 
 st.divider()
 
-# ======================= UI 3: 이력서 인덱싱 ===============
+# -----------------------------------------------------------------------------
+# UI 3) 이력서 업로드/인덱싱
+# -----------------------------------------------------------------------------
 st.header("3) 내 이력서/프로젝트 업로드")
 uploads = st.file_uploader("여러 개 업로드 가능", type=["pdf","txt","md","docx"], accept_multiple_files=True)
 _RESUME_CHUNK=500; _RESUME_OVLP=100
-try:
-    import pypdf
-except Exception:
-    pypdf = None
-try:
-    import docx2txt
-except Exception:
-    docx2txt = None
+
+# **[수정]** 의존성 누락 시 사용자에게 명시적으로 안내
+if pypdf is None: st.caption("PDF 파일 파싱을 위해 `pypdf` 패키지 설치가 필요합니다.")
+if docx2txt is None: st.caption("DOCX 파일 파싱을 위해 `docx2txt` 패키지 설치가 필요합니다.")
 
 def read_pdf(data: bytes) -> str:
-    if pypdf is None: return ""
+    if pypdf is None: return "PDF 파서(`pypdf`)를 설치해야 합니다."
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
         return "\n\n".join([(reader.pages[i].extract_text() or "") for i in range(len(reader.pages))])
     except Exception: return ""
 
-def read_docx(data: bytes) -> str:
-    if docx2txt is None: return ""
+def read_docx_file(data: bytes) -> str:
+    if docx2txt is None: return "DOCX 파서(`docx2txt`)를 설치해야 합니다."
     try:
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
             tmp.write(data); tmp.flush()
             return docx2txt.process(tmp.name) or ""
     except Exception: return ""
 
-def read_uploaded(up) -> str:
-    name = up.name.lower(); data = up.read()
+def read_file_text(uploaded) -> str:
+    name = uploaded.name.lower(); data = uploaded.read()
     if name.endswith((".txt",".md")):
         for enc in ("utf-8","cp949","euc-kr"):
             try: return data.decode(enc)
             except Exception: continue
         return data.decode("utf-8", errors="ignore")
     if name.endswith(".pdf"):  return read_pdf(data)
-    if name.endswith(".docx"): return read_docx(data)
+    if name.endswith(".docx"): return read_docx_file(data)
     return ""
 
 if st.button("이력서 인덱싱", type="secondary"):
     if not uploads: st.warning("파일을 업로드하세요.")
     else:
-        texts=[]
+        all_text=[]
+        error_found = False
         for up in uploads:
-            t = read_uploaded(up)
-            if t: texts.append(t)
-        resume_text = "\n\n".join(texts)
+            t = read_file_text(up)
+            # **[수정]** 파서 누락 시 에러 처리
+            if t.startswith("PDF 파서") or t.startswith("DOCX 파서"):
+                 st.error(t)
+                 error_found = True
+                 continue
+            if t: all_text.append(t)
+        
+        if error_found: # 에러가 발생했으면 인덱싱 중단
+            st.warning("일부 파일의 텍스트 추출을 건너뛰었습니다. 필요한 파서를 설치해주세요.")
+        
+        resume_text = "\n\n".join(all_text)
         if not resume_text.strip(): st.error("텍스트 추출 실패")
         else:
             chunks = chunk(resume_text, size=_RESUME_CHUNK, overlap=_RESUME_OVLP)
@@ -806,18 +935,65 @@ if st.button("이력서 인덱싱", type="secondary"):
 
 st.divider()
 
-# ======================= UI 4~7: Q/A & 코칭 ===============
-st.header("4) 질문 생성 & 답변 초안 (RAG)")
+# -----------------------------------------------------------------------------
+# UI 4) 이력서 기반 자소서 생성
+# -----------------------------------------------------------------------------
+st.header("4) 이력서 기반 자소서 생성")
+topic = st.text_input("회사 요청 주제(선택)", placeholder="예: 지원동기 / 협업 경험 / 문제해결 사례 등")
+
+def build_cover_letter(clean_struct: Dict, resume_text: str, topic_hint: str, model: str) -> str:
+    enrich = {"vision": st.session_state.company_vision[:6],
+              "talent": st.session_state.company_talent[:6],
+              "news": [n.get("title","") for n in st.session_state.company_news[:3]]}
+    company = json.dumps({"clean":clean_struct, "extra":enrich}, ensure_ascii=False)
+    resume_snip = resume_text.strip()[:9000]
+    system = ("너는 한국어 자기소개서 전문가다. 회사/직무 요건과 후보자의 이력서를 참고해 "
+              "회사 특화 자소서를 작성한다. 과장/허위 금지, 수치/지표/기간/임팩트 중심.")
+    req = (f"회사 측 요청 주제는 '{topic_hint.strip()}' 이다. 이 주제를 중심으로 서술." 
+           if topic_hint and topic_hint.strip()
+           else "특정 주제가 없으므로 채용요건, 비전/인재상과의 정합성을 강조.")
+    user = (f"[회사/직무 요약(JSON)]\n{company}\n\n[후보자 이력서]\n{resume_snip}\n\n"
+            f"[작성 지시]\n- {req}\n- 분량 600~900자\n"
+            "- 구성: 지원동기→역량/경험→성과/지표→입사 후 기여→마무리\n"
+            "- 중복/미사여구 제거, 자연스러운 1인칭.")
+    try:
+        r = client.chat.completions.create(model=model, temperature=0.4, max_tokens=800,
+                                           messages=[{"role":"system","content":system},{"role":"user","content":user}])
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(자소서 생성 실패: {e})"
+
+if st.button("자소서 생성", type="primary"):
+    if not st.session_state.clean_struct:
+        st.warning("먼저 회사 URL을 정제하세요.")
+    elif not st.session_state.resume_raw.strip():
+        st.warning("먼저 이력서를 업로드하고 '이력서 인덱싱'을 눌러주세요.")
+    else:
+        with st.spinner("자소서 생성 중..."):
+            cover = build_cover_letter(st.session_state.clean_struct, st.session_state.resume_raw, topic, CHAT_MODEL)
+        st.subheader("자소서 (생성 결과)")
+        st.write(cover)
+        st.download_button("자소서 TXT 다운로드", data=cover.encode("utf-8"),
+                           file_name="cover_letter.txt", mime="text/plain")
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# UI 5) 질문 생성 & 답변 초안 (RAG 결합)
+# -----------------------------------------------------------------------------
+st.header("5) 질문 생성 & 답변 초안 (RAG 결합)")
 level = st.selectbox("난이도/연차", ["주니어","미들","시니어"], index=0)
 
 c1, c2 = st.columns(2)
 with c1:
-    if st.button("새 질문", type="primary"):
-        if not st.session_state.clean:
+    if st.button("새 질문 받기", type="primary"):
+        if not st.session_state.clean_struct:
             st.warning("먼저 회사 URL을 정제하세요.")
+        elif not st.session_state.resume_embeds is not None:
+             st.warning("면접 질문은 이력서 기반으로 생성됩니다. 이력서 인덱싱을 완료해주세요.")
         else:
             q = llm_generate_one_question_with_resume(
-                st.session_state.clean, level, CHAT_MODEL,
+                st.session_state.clean_struct, level, CHAT_MODEL,
                 st.session_state.resume_chunks, st.session_state.resume_embeds
             )
             if q:
@@ -825,16 +1001,20 @@ with c1:
                 st.session_state.answer_text = ""
                 st.session_state.last_result = None
                 st.session_state.followups = []
+                st.session_state.selected_followup = ""
+                st.session_state.followup_answer = ""
                 st.success("질문 생성 완료!")
             else:
                 st.error("질문 생성 실패")
 with c2:
-    if st.button("RAG로 답변 초안", type="secondary"):
+    if st.button("RAG로 답변 초안 생성", type="secondary"):
         if not st.session_state.current_question:
             st.warning("먼저 질문을 생성하세요.")
+        elif not st.session_state.resume_embeds is not None:
+             st.warning("RAG 답변은 이력서 기반으로 생성됩니다. 이력서 인덱싱을 완료해주세요.")
         else:
             draft = llm_draft_answer(
-                st.session_state.clean, st.session_state.current_question, CHAT_MODEL,
+                st.session_state.clean_struct, st.session_state.current_question, CHAT_MODEL,
                 st.session_state.resume_chunks, st.session_state.resume_embeds
             )
             if draft:
@@ -843,19 +1023,24 @@ with c2:
             else:
                 st.error("초안 생성 실패")
 
-st.text_area("질문", value=st.session_state.current_question, height=90)
+st.text_area("질문", value=st.session_state.current_question, height=100)
 st.text_area("나의 답변 (초안을 편집해 완성)", key="answer_text", height=200)
 
-st.header("5) 채점 & 코칭")
-if st.button("채점 실행", type="primary"):
+# -----------------------------------------------------------------------------
+# UI 6) 채점 & 코칭
+# -----------------------------------------------------------------------------
+st.header("6) 채점 & 코칭")
+if st.button("채점 & 코칭 실행", type="primary"):
     if not st.session_state.current_question:
         st.warning("먼저 질문을 생성하세요.")
     elif not st.session_state.answer_text.strip():
         st.warning("답변을 작성해 주세요.")
+    elif not st.session_state.resume_embeds is not None:
+        st.warning("채점은 이력서 내용과의 정합성 검토를 포함합니다. 이력서 인덱싱을 완료해주세요.")
     else:
         with st.spinner("채점/코칭 중..."):
             res = llm_score_and_coach_strict(
-                st.session_state.clean,
+                st.session_state.clean_struct,
                 st.session_state.current_question,
                 st.session_state.answer_text,
                 CHAT_MODEL,
@@ -863,7 +1048,7 @@ if st.button("채점 실행", type="primary"):
                 st.session_state.resume_embeds
             )
         st.session_state.last_result = res
-        st.success("완료!")
+        st.success("채점/코칭 완료!")
 
 st.divider()
 st.subheader("피드백 결과")
@@ -874,12 +1059,72 @@ if last:
     for it in last.get("criteria", []):
         st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
     if last.get("strengths"):
-        st.markdown("**강점**");  [st.markdown(f"- {s}") for s in last["strengths"]]
+        st.markdown("**강점**")
+        for s in last["strengths"]:
+            st.markdown(f"- {s}")
     if last.get("risks"):
-        st.markdown("**감점 요인/리스크**"); [st.markdown(f"- {r}") for r in last["risks"]]
+        st.markdown("**감점 요인/리스크**")
+        for r in last["risks"]:
+            st.markdown(f"- {r}")
     if last.get("improvements"):
-        st.markdown("**개선 포인트**"); [st.markdown(f"- {x}") for x in last["improvements"]]
+        st.markdown("**개선 포인트**")
+        for im in last["improvements"]:
+            st.markdown(f"- {im}")
     if last.get("revised_answer"):
-        st.markdown("**수정본(STAR)**"); st.write(last["revised_answer"])
+        st.markdown("**수정본 답변(STAR)**")
+        st.write(last["revised_answer"])
 else:
-    st.caption("아직 채점 결과가 없습니다.")
+    st.info("아직 채점 결과가 없습니다.")
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# UI 7) 팔로업 질문 · 답변 · 피드백
+# -----------------------------------------------------------------------------
+st.subheader("팔로업 질문 · 답변 · 피드백")
+
+if last and not st.session_state.followups:
+    try:
+        ctx = json.dumps({"company": st.session_state.clean_struct,
+                          "vision": st.session_state.company_vision[:6],
+                          "talent": st.session_state.company_talent[:6],
+                          "news": [n.get("title","") for n in st.session_state.company_news[:3]]},
+                         ensure_ascii=False)
+        msg = {"role":"user","content":(
+            f"[회사/직무/요건/비전/이슈]\n{ctx}\n\n[지원자 답변]\n{st.session_state.answer_text}\n\n"
+            "면접관 관점에서 팔로업 질문 3개를 한 줄씩 한국어로 제안해줘. "
+            "기존 질문과 중복되지 않게, 지표/리스크/트레이드오프/의사결정 근거를 섞어줘.")}
+        r = client.chat.completions.create(model=CHAT_MODEL, temperature=0.7,
+                                           messages=[{"role":"system","content":"면접 팔로업 생성기"}, msg])
+        followups = [re.sub(r'^\s*\d+[\).\s-]*','', l).strip()
+                     for l in r.choices[0].message.content.splitlines() if l.strip()]
+        st.session_state.followups = followups[:3]
+    except Exception:
+        st.session_state.followups = []
+
+if last:
+    if st.session_state.followups:
+        st.markdown("**팔로업 질문 제안**")
+        for i, f in enumerate(st.session_state.followups, 1):
+            st.markdown(f"- ({i}) {f}")
+        st.selectbox("채점 받을 팔로업 질문 선택", st.session_state.followups, index=0, key="selected_followup")
+        st.text_area("팔로업 질문에 대한 나의 답변", key="followup_answer", height=160)
+        if st.button("팔로업 채점 & 피드백", type="secondary"):
+            fu_q = st.session_state.get("selected_followup",""); fu_ans = st.session_state.get("followup_answer","")
+            if not fu_q: st.warning("팔로업 질문을 선택하세요.")
+            elif not fu_ans.strip(): st.warning("팔로업 답변을 작성하세요.")
+            else:
+                with st.spinner("팔로업 채점 중..."):
+                    res_fu = llm_score_and_coach_strict(
+                        st.session_state.clean_struct, fu_q, fu_ans, CHAT_MODEL,
+                        st.session_state.resume_chunks, st.session_state.resume_embeds
+                    )
+                st.markdown("**팔로업 결과**")
+                st.metric("총점(/100)", res_fu.get("overall_score", 0))
+                for it in res_fu.get("criteria", []):
+                    st.markdown(f"- **{it['name']}**: {it['score']}/20 — {it.get('comment','')}")
+                if res_fu.get("revised_answer",""):
+                    st.markdown("**팔로업 수정본(STAR)**")
+                    st.write(res_fu["revised_answer"])
+    else:
+        st.caption("팔로업 질문은 메인 질문 채점 직후 자동 제안됩니다.")
