@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Job Helper Bot - FULL (Static + Dynamic Crawl, Company Home Booster, RAG Coach)
-# 실행: streamlit run Job_Helper_Bot_full.py
+# Job Helper Bot - FULL (Static + Dynamic Crawl, lxml-free, Company Home Booster, RAG Coach)
+# 실행: streamlit run Job_Helper_Bot_full_fixed.py
 ################################################################################
-import os, re, io, json, time, shutil, tempfile, traceback, urllib.parse
+import os, re, io, json, time, shutil, tempfile, urllib.parse, traceback
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
 
 import streamlit as st
 import numpy as np
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup   # 파서는 soup_html()로 통일
 import html2text
+from xml.etree import ElementTree as ET
 
 # ======================= OpenAI ===========================
 try:
@@ -63,6 +64,33 @@ def normalize_url(u: str) -> Optional[str]:
     if not re.match(r"^https?://", u): u = "https://" + u
     parts = urllib.parse.urlsplit(u)
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+
+# =================== Parser-safe helpers ==================
+def soup_html(html: str) -> BeautifulSoup:
+    """lxml 미설치 환경에서도 안전한 HTML 파싱 (내장 html.parser 사용)"""
+    return BeautifulSoup(html or "", "html.parser")
+
+def parse_sitemap_locations(xml_text: str) -> List[str]:
+    """sitemap.xml에서 <loc> 텍스트 리스트 추출 (ElementTree 사용)"""
+    out = []
+    if not xml_text:
+        return out
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {}
+        if root.tag.startswith("{"):
+            uri = root.tag.split("}")[0].strip("{")
+            ns = {"ns": uri}
+            loc_tags = root.findall(".//ns:loc", ns)
+        else:
+            loc_tags = root.findall(".//loc")
+        for loc in loc_tags:
+            if loc is not None and loc.text:
+                out.append(loc.text.strip())
+    except Exception:
+        # 파싱 실패 시 정규식 폴백
+        out = re.findall(r"<loc>\s*([^<>\s]+)\s*</loc>", xml_text, flags=re.I)
+    return out
 
 # ======================= Selenium =========================
 HAS_SELENIUM = True
@@ -175,7 +203,7 @@ def get_html_dynamic(url: str, timeout: int) -> str:
 # =================== 채용공고 → 텍스트 ====================
 def extract_wanted_next(html: str) -> str:
     try:
-        soup = BeautifulSoup(html or "", "html.parser")
+        soup = soup_html(html)
         tag = soup.select_one("script#__NEXT_DATA__")
         if not tag: return ""
         data = json.loads((tag.string or tag.text or "").strip())
@@ -313,7 +341,7 @@ def extract_company_meta_from_html(html: Optional[str]) -> Dict[str, str]:
     meta = {"company_name":"","company_intro":"","job_title":""}
     if not html: return meta
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = soup_html(html)
         cand=[]
         og = soup.find("meta", {"property":"og:site_name"})
         if og and og.get("content"): cand.append(og["content"])
@@ -376,7 +404,7 @@ def _http_get(url: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     return ""
 
 def extract_texts(html: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
+    soup = soup_html(html)
     texts=[]
     for tag in soup.find_all(["h1","h2","h3","h4","p","li"]):
         t = tag.get_text(" ", strip=True)
@@ -387,7 +415,7 @@ def extract_texts(html: str) -> List[str]:
     return texts
 
 def parse_jsonld_and_meta(html: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
+    soup = soup_html(html)
     out=[]
     for sel in ["meta[name='description']","meta[property='og:description']","meta[property='og:title']"]:
         tag = soup.select_one(sel)
@@ -414,7 +442,7 @@ def parse_jsonld_and_meta(html: str) -> List[str]:
     return res
 
 def collect_nav_links(html: str, base_url: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
+    soup = soup_html(html)
     cands=[]
     for a in soup.find_all("a", href=True):
         txt  = (a.get_text(" ", strip=True) or "").lower()
@@ -427,8 +455,7 @@ def collect_nav_links(html: str, base_url: str) -> List[str]:
                "/kr","/ko","/ko-kr","who-we-are","what-we-do","our-story","brand"
            ]):
             cands.append(urllib.parse.urljoin(base_url, href))
-    uniq,s=set(),[]
-    out=[]
+    uniq=set(); out=[]
     for u in cands:
         if u not in uniq:
             uniq.add(u); out.append(u)
@@ -437,19 +464,16 @@ def collect_nav_links(html: str, base_url: str) -> List[str]:
 def read_sitemap(home: str) -> List[str]:
     base = (normalize_url(home) or "").rstrip("/")
     site = base + "/sitemap.xml"
-    try:
-        xml = _http_get(site, timeout=6)
-        if not xml or "<urlset" not in xml: return []
-        soup = BeautifulSoup(xml, "xml")
-        urls = [loc.get_text() for loc in soup.find_all("loc")]
-        keep=[]
-        for u in urls:
-            ul = u.lower()
-            if any(k in ul for k in ["about","company","mission","vision","values","culture","talent","people","careers","esg","sustainability","/ko","/kr"]):
-                keep.append(u)
-        return keep[:25]
-    except Exception:
+    xml = _http_get(site, timeout=6)
+    if not xml:
         return []
+    urls = parse_sitemap_locations(xml)
+    keep=[]
+    for u in urls:
+        ul = u.lower()
+        if any(k in ul for k in ["about","company","mission","vision","values","culture","talent","people","careers","esg","sustainability","/ko","/kr","ko-kr"]):
+            keep.append(u)
+    return keep[:25]
 
 def company_home_harvest(home_url: str, prefer_dynamic: bool, timeout: int, max_pages: int) -> Dict[str, List[str]]:
     out = {"vision": [], "talent": []}
@@ -499,7 +523,7 @@ def company_home_harvest(home_url: str, prefer_dynamic: bool, timeout: int, max_
     return out
 
 def infer_home_from_job(job_html: str, job_url: str, company_name: str) -> List[str]:
-    soup = BeautifulSoup(job_html or "", "lxml")
+    soup = soup_html(job_html)
     anchors = soup.find_all("a", href=True)
     cands=[]
     cmp_l = (company_name or "").lower()
@@ -534,12 +558,14 @@ def google_news_rss_multi(company: str, max_items: int = 5) -> List[Dict]:
         try:
             r = requests.get(url, timeout=6)
             if r.status_code != 200: return []
-            soup = BeautifulSoup(r.text, "xml")
+            soup = soup_html(r.text)  # RSS는 xml이지만 제목/링크만 단순 추출하므로 html 파서로 충분
+            items = soup.find_all("item")
             out=[]
-            for it in soup.find_all("item")[:max_items]:
-                out.append({"title": (it.title.get_text() if it.title else "").strip(),
-                            "link": (it.link.get_text() if it.link else "").strip(),
-                            "pubDate": (it.pubDate.get_text() if it.pubDate else "").strip()})
+            for it in items[:max_items]:
+                title = it.find("title").get_text(strip=True) if it.find("title") else ""
+                link  = it.find("link").get_text(strip=True) if it.find("link") else ""
+                pub   = it.find("pubdate").get_text(strip=True) if it.find("pubdate") else ""
+                out.append({"title": title, "link": link, "pubDate": pub})
             return out
         except Exception:
             return []
