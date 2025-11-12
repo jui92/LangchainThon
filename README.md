@@ -144,6 +144,3 @@ LangchainThon/
 ├── requirements.txt
 └── README.md
 ```
-
-## 시연 연상
-<video src="https://github.com/username/repo/blob/main/demo.mp4](https://file.notion.so/f/f/ae52d25d-b624-81e3-9a44-0003bf12d822/9c56a2c8-e562-451d-b2c5-333d7d81f0c9/ScreenRecording_10-27-2025_16-50-32_1.mp4?table=block&id=2952d25d-b624-81c1-93cf-dca69613a50d&spaceId=ae52d25d-b624-81e3-9a44-0003bf12d822&expirationTimestamp=1762992000000&signature=TMD8UlzOQTFe97EAgsIGgPyfUAUiiNU2KAPVihPnXE8&downloadName=ScreenRecording_10-27-2025+16-50-32_1.mp4" controls width="600"></video>
